@@ -1,0 +1,21 @@
+# Rust
+/target/
+**/target/
+# Cargo.lock is committed: relay-server is a bin crate, not a library.
+
+# Emacs / Elisp
+*.elc
+*.eln
+.eldev/
+/eln-cache/
+*~
+\#*\#
+.\#*
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.markdown-preview.html
+
+# Local-only working notes (not tracked)
+JOURNAL.md

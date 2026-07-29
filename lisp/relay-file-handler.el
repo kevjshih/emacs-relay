@@ -253,8 +253,32 @@ what let this go unnoticed at first."
                (not (relay--h-file-exists-p buffer-file-name)))
       (relay-conflict--install-buffer "" (list :schema 1 :state "missing") 'utf-8))))
 
-(defun relay--h-insert-file-contents (filename &optional visit _beg _end replace)
-  (let* ((p (relay--parse filename)) (conn (relay--connection (car p)))
+(defun relay--h-insert-file-contents (filename &optional visit beg end replace)
+  (if (and beg end)
+      ;; Range reads are deliberately uncached and never establish BASE:
+      ;; callers use them for bounded transcript tails/history, not visits.
+      (let* ((p (relay--parse filename))
+             (conn (relay--connection (car p)))
+             (hello (relay-conn-hello conn))
+             (reply (if (member "read-range-v1" (plist-get hello :capabilities))
+                        (relay--request conn "read_range" :path (cdr p)
+                                        :start beg :end end)
+                      ;; Compatibility with an older revisions-v1 server.
+                      ;; This fallback is intentionally bounded by the old
+                      ;; server's normal read limit; new servers are required
+                      ;; for large-file range access.
+                      (let* ((full (relay--request conn "read" :path (cdr p)))
+                             (all (base64-decode-string (plist-get full :bytes_b64))))
+                        (list :bytes_b64
+                              (base64-encode-string
+                               (substring all (min beg (length all))
+                                          (min end (length all))) t)))))
+             (bytes (base64-decode-string (plist-get reply :bytes_b64)))
+             (text (decode-coding-string bytes 'utf-8)))
+        (when replace (erase-buffer))
+        (insert text)
+        (list filename (length text)))
+    (let* ((p (relay--parse filename)) (conn (relay--connection (car p)))
          (entry (relay--content-cache-get-entry (car p) (cdr p)))
          ;; Never establish BASE from an old cache entry that has no revision.
          ;; Reverts must always fetch a fresh revision; only initial opens may
@@ -294,7 +318,7 @@ what let this go unnoticed at first."
       (unless visit
         (setq-local relay-conflict--pending-read
                     (list :filename filename :bytes bytes :revision revision)))
-      (list filename (length text)))))
+      (list filename (length text))))))
 
 (defun relay--h-write-region (start end filename &optional append visit _lock mustbenew)
   ;; APPEND can be t, nil, or an integer offset (rare, e.g. rewriting from a

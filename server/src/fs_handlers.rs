@@ -80,6 +80,15 @@ pub(crate) fn handle_fs(req: &Value, tx: &SyncSender<Vec<u8>>, registry: &ExecRe
         finish_revision(tx, id, result);
         return;
     }
+    if op == "read_range" {
+        let start = req.get("start").and_then(Value::as_u64).unwrap_or(0);
+        let end = req.get("end").and_then(Value::as_u64).unwrap_or(start);
+        let result = revisions::read_range(Path::new(&path), start, end)
+            .map(|bytes| json!({"bytes_b64": B64.encode(bytes), "start": start, "end": end}))
+            .map_err(|error| error.readable());
+        framing::finish(tx, id, result);
+        return;
+    }
     if op == "write" {
         let append = req.get("append").and_then(Value::as_bool).unwrap_or(false);
         let must_be_new = req
@@ -682,6 +691,18 @@ mod tests {
             revisions::read_with_revision(&path),
             Err(revisions::RevisionError::TooLarge)
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_range_returns_exact_bytes_and_supports_large_files() {
+        let path = temp_path("range-read");
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(b"prefix-\xc3\xa9-suffix").unwrap();
+        file.set_len(17 * 1024 * 1024).unwrap();
+        let bytes = revisions::read_range(&path, 7, 11).unwrap();
+        assert_eq!(bytes, vec![b'\xc3', b'\xa9', b'-', b's']);
+        assert!(revisions::read_range(&path, 0, 1024 * 1024 + 1).is_err());
         fs::remove_file(path).unwrap();
     }
 

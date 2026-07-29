@@ -28,7 +28,7 @@ pub(crate) fn handle_ctl(
         "hello" => Ok(json!({
             "server_version": SERVER_VERSION,
             "protocol_version": PROTOCOL_VERSION,
-            "capabilities": ["revisions-v1"],
+            "capabilities": ["revisions-v1", "exec-v1"],
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
         })),

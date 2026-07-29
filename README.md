@@ -4,14 +4,20 @@ A thin local GUI Emacs attached to a remote dev host, giving you instant local
 editing and TRAMP-like file browsing with less per-operation latency than
 TRAMP.
 
-> **Status: Milestone 0 implemented.** The async `/relay:` file layer — browse,
-> open, edit, save, dired, freshness via FS watch, directory/content prefetch,
-> streaming listings for large directories — is working, tested over real SSH to
-> a Linux host, and exercised locally (no-SSH transport) on macOS. This is the
-> whole of what's built today; remote LSP/search/git/build execution and local
-> tree-sitter syntax (mentioned below as design direction) are **not
-> implemented**. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design
-> and roadmap beyond M0 — treat it as a design plan, not a feature list.
+> **Status: Milestone 0 implemented, plus a small synchronous exec primitive.**
+> The async `/relay:` file layer — browse, open, edit, save, dired, freshness
+> via FS watch, directory/content prefetch, streaming listings for large
+> directories — is working, tested over real SSH to a Linux host, and
+> exercised locally (no-SSH transport) on macOS. Alongside that, `relay-exec`
+> (see [Usage](#running-a-command-remotely) below) runs one argv command on
+> the remote host and blocks for its exit code plus captured stdout/stderr —
+> deliberately not the same thing as real `process-file`/`start-file-process`
+> support (no streaming stdin/stdout, no async sentinels, no long-running
+> interactive processes), which remains **not implemented**, along with
+> remote LSP/search/git/build integration and local tree-sitter syntax
+> (mentioned below as design direction). See
+> [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design and roadmap
+> beyond M0 — treat it as a design plan, not a feature list.
 
 **Scope note:** this is a personal project, built for the author's own
 workflow, not a general-purpose TRAMP replacement aiming for broad
@@ -256,6 +262,30 @@ The first revision-safe release supports regular UTF-8 files up to 16 MiB.
 Binary files, final symlinks, hard-linked files, directories/FIFOs and other
 non-regular files are rejected for conditional replacement rather than risking a
 destructive write.
+
+### Running a command remotely
+
+```elisp
+(relay-exec "ssh+HOST" '("tmux" "list-panes" "-a"))
+;; => (:exit-code 0 :stdout "...\n" :stderr "")
+```
+
+`relay-exec` runs one command on the server side and blocks until it exits
+(or times out), returning a plist of `:exit-code`, `:stdout`, and `:stderr`.
+COMMAND is always an argv list — the program name, then its arguments — and
+is never interpreted through a shell on either end; there is no way to pass
+a shell string through this function. An optional third argument sets the
+remote working directory, and an optional fourth overrides how long the
+command may run before being killed (the client's own wait is extended to
+match, so a generous timeout doesn't just produce a premature client-side
+error instead of the server's own clear message).
+
+This requires a server advertising the `exec-v1` capability — reinstall via
+`scripts/install-server.sh` (below) if an older server errors with a
+capability-mismatch message. It's a small, deliberately synchronous
+primitive (see the status note at the top of this document) — reach for it
+for short, well-defined commands, not anything that needs to stream output
+or run indefinitely.
 
 ### Content-prefetch profiles
 

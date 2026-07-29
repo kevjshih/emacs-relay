@@ -77,7 +77,8 @@ The transport shells out to your system `ssh`, so `~/.ssh/config` (Host aliases,
 | open + revision-safe visited save + local transformed auto-save | implemented for regular UTF-8 files ≤16 MiB |
 | dired (`insert-directory`, including revert) | implemented |
 | file-notify / freshness | implemented (invalidate + deferred callback; coarse on overflow) |
-| `process-file` / shell / magit / grep | **not supported** (Milestone 1) |
+| `relay-exec` (synchronous, argv-only, one command in/exit+stdout+stderr out) | implemented |
+| `process-file`/`start-file-process` (streaming, async, interactive processes) / magit / grep | **not supported** (Milestone 1) |
 | binary merges, final symlinks, hardlinks, FIFOs/directories, large files | rejected for revision-safe replacement |
 
 ## Revision-safe save checks
@@ -93,6 +94,8 @@ run the Rust and focused ERT suites from the repository root:
   -l test/relay-tests.el -f ert-run-tests-batch-and-exit
 /Applications/Emacs.app/Contents/MacOS/Emacs --batch -Q -L lisp -L test \
   -l test/relay-conflict-tests.el -f ert-run-tests-batch-and-exit
+/Applications/Emacs.app/Contents/MacOS/Emacs --batch -Q -L lisp -L test \
+  -l test/relay-exec-tests.el -f ert-run-tests-batch-and-exit
 /Applications/Emacs.app/Contents/MacOS/Emacs --batch -Q -L lisp \
   --eval '(setq byte-compile-error-on-warn t)' \
   -f batch-byte-compile lisp/*.el test/*.el

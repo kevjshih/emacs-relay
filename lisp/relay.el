@@ -30,6 +30,7 @@
 (require 'relay-completion)
 (require 'relay-conflict)
 (require 'relay-file-handler)
+(require 'relay-exec)
 
 (provide 'relay)
 ;;; relay.el ends here

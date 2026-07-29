@@ -8,15 +8,37 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::mpsc::SyncSender;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, SyncSender};
+use std::time::{Duration, Instant};
 
 /// Chunk size for streaming `readdir` replies. Not client-configurable for
 /// this first cut — a plain constant is enough to fix the actual problem
 /// (no giant single blob, no unbounded buffer before the first byte).
 const READDIR_CHUNK_SIZE: usize = 2000;
+
+/// Default wall-clock budget for `exec` when the request omits `timeout_ms`.
+/// A hung child must not be allowed to occupy a worker thread indefinitely —
+/// the pool is shared (8 threads total) with every other FS operation.
+const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
+
+/// Floor applied to the remaining budget when collecting `exec`'s stdout/
+/// stderr on the success path (see `exec_command`). `try_wait()` is polled
+/// every 20ms, so it can observe the child's exit slightly after
+/// `timeout_ms` has technically elapsed, leaving ~0ms of nominal budget to
+/// collect output that a concurrent reader thread has, in the ordinary
+/// case, already finished reading and is a `recv` away from delivering.
+/// Without this floor, `recv_timeout` on an exhausted budget would behave
+/// like `try_recv` and could spuriously report a timeout for a command
+/// that actually succeeded and whose output was microseconds away. This
+/// grace period is intentionally tiny relative to `timeout_ms` and does
+/// not change the overall guarantee: total time is still bounded by
+/// `timeout_ms` plus this small, fixed collection grace, not by however
+/// long a lingering grandchild lives.
+const EXEC_COLLECT_GRACE_MS: u64 = 100;
 
 /// FS ops: run on their own thread (see main loop) so slow content ops never
 /// head-of-line-block metadata ops.
@@ -88,6 +110,13 @@ pub(crate) fn handle_fs(req: &Value, tx: &SyncSender<Vec<u8>>) {
     let result: Result<Value, String> = match op {
         "stat" => Ok(json!({ "attrs": stat_value(Path::new(&path)) })),
         "resolve" => resolve(&path),
+        // `exec` has no `path` of its own in the sense every other op here
+        // does — `path` above (computed from `req.get("path")`, empty when
+        // absent) is simply unused by this arm. It spawns an unrelated
+        // process, so it deliberately does NOT take `_mutation_guard`
+        // (that lock exists to serialize filesystem-mutation ops against
+        // the revision-tracking system; orthogonal here).
+        "exec" => exec_command(req),
         "write" => {
             let b64 = req.get("bytes_b64").and_then(Value::as_str).unwrap_or("");
             let append = req.get("append").and_then(Value::as_bool).unwrap_or(false);
@@ -313,6 +342,183 @@ fn resolve(path: &str) -> Result<Value, String> {
     }))
 }
 
+/// Runs `command` (argv, program name first — NEVER a shell string) and
+/// returns its exit code plus captured stdout/stderr, base64-encoded for the
+/// same binary-safety reason file reads/writes already are.
+///
+/// `cwd`, if present, is expanded via `expand_home` and set on the child
+/// (mirroring how other ops expand `~` in `path`); if absent, the child
+/// inherits this server process's own working directory. `timeout_ms`
+/// defaults to `DEFAULT_EXEC_TIMEOUT_MS` when omitted. A child that outlives
+/// its timeout is killed and this returns `Err` promptly — it never
+/// occupies this worker thread indefinitely, even if the direct child left
+/// behind a grandchild holding its stdout/stderr pipes open (see the
+/// timeout branch below for why that case must NOT join the drain
+/// threads). The same grandchild scenario is also guarded on the ordinary
+/// success path: the direct child can exit (via `try_wait`) while a
+/// grandchild it backgrounded (e.g. `cmd &`, a detached `tmux` session)
+/// still holds stdout/stderr open. Collecting the drain threads' output on
+/// that path is bounded by the *remaining* `timeout_ms` budget, floored at
+/// `EXEC_COLLECT_GRACE_MS` (via a channel + `recv_timeout`, not an
+/// unconditional `join`), so total time is bounded by `timeout_ms` plus
+/// that small fixed grace — not by however long a lingering grandchild
+/// lives — on both the timeout and success paths.
+fn exec_command(req: &Value) -> Result<Value, String> {
+    let command = req
+        .get("command")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "exec: missing or non-array \"command\"".to_string())?;
+    if command.is_empty() {
+        return Err("exec: \"command\" must not be empty".into());
+    }
+    let argv: Vec<String> = command
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| "exec: \"command\" must be an array of strings".to_string())?;
+
+    let timeout_ms = req
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS);
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    if let Some(cwd) = req.get("cwd").and_then(Value::as_str) {
+        cmd.current_dir(expand_home(cwd));
+    }
+    // Explicit, not incidental: `Command`'s default is to *inherit* the
+    // parent's stdio when a stream isn't overridden. This server's own
+    // stdin/stdout are the framed RPC protocol stream — silently inheriting
+    // them into an arbitrary child would let it consume protocol bytes or
+    // write raw bytes into a framed stream expecting length-prefixed JSON.
+    // stdin is closed rather than piped: nothing in this synchronous
+    // request/reply primitive ever sends a child bytes.
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("exec: spawn failed: {e}"))?;
+
+    // Drain stdout/stderr on their own threads, concurrently with the
+    // try_wait poll loop below, rather than reading only after the child
+    // exits. A child that writes enough output to fill its pipe's kernel
+    // buffer before exiting would otherwise block forever on that write if
+    // nothing reads until after `wait()` returns — which would defeat the
+    // timeout below entirely (the worker thread would still hang, just
+    // blocked inside the child's write() instead of our poll loop).
+    // Each reader thread reports its collected buffer back over a channel,
+    // rather than as its `JoinHandle` return value. That lets the caller
+    // collect the result with `recv_timeout` (bounded by the remaining
+    // timeout budget) instead of an unconditional, unbounded `join` — see
+    // the success path below, which needs exactly that to stay bounded
+    // when a grandchild is still holding the pipe open.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stdout_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = stdout_tx.send(buf);
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = stderr_tx.send(buf);
+    });
+
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("exec: wait failed: {e}"));
+            }
+        }
+    };
+
+    let Some(status) = status else {
+        // Do NOT join the drain threads here. Killing the direct child only
+        // closes *its* end of the pipes; if it forked a grandchild that
+        // inherited stdout/stderr (e.g. backgrounded a process, `sh -c
+        // "cmd &"`), that grandchild can keep the write end open long after
+        // `kill()`/`wait()` return, and `read_to_end` blocks until its own
+        // EOF -- so joining here would reintroduce exactly the hang the
+        // timeout exists to prevent. Dropping the `JoinHandle`s detaches
+        // those threads instead; their buffers are being discarded on this
+        // path anyway.
+        return Err(format!("exec: timed out after {timeout_ms}ms, process killed"));
+    };
+
+    // The same residual exposure applies here on the *success* path: if the
+    // child left behind a grandchild still holding these pipes open,
+    // waiting for the drain threads to see EOF can block past the child's
+    // own exit for as long as that grandchild lives. Bound that wait by
+    // whatever remains of the original `timeout_ms` window (computed from
+    // the same `start`/`timeout` the poll loop above already tracks, not a
+    // second independent clock) rather than an unconditional `join`. The
+    // remaining budget is floored at `EXEC_COLLECT_GRACE_MS`: `try_wait()`
+    // is only polled every 20ms, so it can observe success with ~0ms of
+    // nominal budget left even though the reader thread (racing
+    // concurrently this whole time) is a `recv` away from delivering
+    // output it already finished reading -- without the floor that would
+    // spuriously report a timeout for a command that truly succeeded. If
+    // either stream still doesn't report back within that floored budget,
+    // this is exactly the same situation the timeout branch above handles
+    // -- the child is already gone (nothing left to `kill()`), so just
+    // detach whichever reader thread(s) haven't finished (dropping their
+    // `JoinHandle`s) and return the same timeout error, so a lingering
+    // grandchild can never block this worker thread indefinitely on either
+    // path.
+    let remaining = timeout
+        .saturating_sub(start.elapsed())
+        .max(Duration::from_millis(EXEC_COLLECT_GRACE_MS));
+    let stdout = match stdout_rx.recv_timeout(remaining) {
+        Ok(buf) => buf,
+        Err(_) => {
+            return Err(format!("exec: timed out after {timeout_ms}ms, process killed"));
+        }
+    };
+    let remaining = timeout
+        .saturating_sub(start.elapsed())
+        .max(Duration::from_millis(EXEC_COLLECT_GRACE_MS));
+    let stderr = match stderr_rx.recv_timeout(remaining) {
+        Ok(buf) => buf,
+        Err(_) => {
+            return Err(format!("exec: timed out after {timeout_ms}ms, process killed"));
+        }
+    };
+    // Both channels reported in time: the drain threads have already
+    // finished (each thread only sends after `read_to_end` returns), so
+    // there's nothing left to join.
+    let _ = stdout_thread;
+    let _ = stderr_thread;
+
+    Ok(json!({
+        "exit_code": status.code(),
+        "stdout_b64": B64.encode(&stdout),
+        "stderr_b64": B64.encode(&stderr),
+    }))
+}
+
 fn write_file(path: &str, b64: &str, append: bool, must_be_new: bool) -> Result<(), String> {
     let bytes = B64.decode(b64).map_err(|e| format!("write decode: {e}"))?;
     if must_be_new {
@@ -368,5 +574,99 @@ mod tests {
             Err(revisions::RevisionError::TooLarge)
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exec_captures_stdout_and_reports_zero_exit() {
+        let req = json!({"command": ["echo", "hello"]});
+        let result = exec_command(&req).unwrap();
+        assert_eq!(result["exit_code"], json!(0));
+        let stdout = B64
+            .decode(result["stdout_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(stdout).unwrap(), "hello\n");
+        let stderr = B64
+            .decode(result["stderr_b64"].as_str().unwrap())
+            .unwrap();
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn exec_reports_nonzero_exit_code() {
+        // An explicit two-element argv naming `sh` as the program is not the
+        // same thing as this server building a shell string itself -- WE
+        // never interpolate `command` through a shell; the test just picks a
+        // target program that's a convenient way to produce a specific exit
+        // code and some stderr output.
+        let req = json!({"command": ["sh", "-c", "echo oops 1>&2; exit 3"]});
+        let result = exec_command(&req).unwrap();
+        assert_eq!(result["exit_code"], json!(3));
+        let stderr = B64
+            .decode(result["stderr_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(stderr).unwrap(), "oops\n");
+    }
+
+    #[test]
+    fn exec_missing_or_empty_command_is_rejected() {
+        assert!(exec_command(&json!({})).is_err());
+        assert!(exec_command(&json!({"command": []})).is_err());
+        assert!(exec_command(&json!({"command": "echo hi"})).is_err());
+        assert!(exec_command(&json!({"command": ["echo", 1]})).is_err());
+    }
+
+    #[test]
+    fn exec_kills_a_hung_child_at_the_timeout_instead_of_hanging_the_test() {
+        let start = Instant::now();
+        let req = json!({"command": ["sleep", "5"], "timeout_ms": 200});
+        let result = exec_command(&req);
+        let elapsed = start.elapsed();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
+        // Generous upper bound so a loaded CI box isn't flaky, while still
+        // proving this did not wait anywhere near the child's own 5s sleep.
+        assert!(elapsed < Duration::from_secs(3), "elapsed = {elapsed:?}");
+    }
+
+    #[test]
+    fn exec_timeout_does_not_hang_when_a_grandchild_keeps_the_pipes_open() {
+        // The direct child here (`sh`) backgrounds a grandchild (the first
+        // `sleep 5 &`) that inherits its stdout/stderr and then exits
+        // itself only after ITS OWN 5s sleep -- so killing the direct
+        // child does not close the grandchild's copy of the pipe write
+        // ends. This reproduces the exact case the timeout branch's "do
+        // not join the drain threads" comment exists for: a naive
+        // join-then-check-timeout ordering would block here for as long
+        // as the grandchild lives (~5s), not the requested 200ms.
+        let start = Instant::now();
+        let req = json!({"command": ["sh", "-c", "sleep 5 & sleep 5"], "timeout_ms": 200});
+        let result = exec_command(&req);
+        let elapsed = start.elapsed();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(elapsed < Duration::from_secs(2), "elapsed = {elapsed:?}");
+    }
+
+    #[test]
+    fn exec_timeout_bounds_a_fast_exiting_parent_with_a_lingering_grandchild() {
+        // Unlike the test above, the *direct* child here (`sh`) exits
+        // almost immediately after backgrounding the grandchild (`sleep
+        // 4`) -- so `try_wait` sees a successful exit well within the
+        // 500ms timeout and the poll loop's timeout branch never fires.
+        // The grandchild still inherited stdout/stderr, though, and keeps
+        // those pipe write-ends open for its own 4s sleep. Before the fix,
+        // the success path's unconditional `join` on the drain threads
+        // blocked for that entire ~4s, completely ignoring `timeout_ms`.
+        // This reproduces that exact shape and proves it's now bounded.
+        let start = Instant::now();
+        let req = json!({"command": ["sh", "-c", "sleep 4 & exit 0"], "timeout_ms": 500});
+        let result = exec_command(&req);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "elapsed = {elapsed:?} (should be bounded by timeout_ms, not the grandchild's 4s sleep)"
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
     }
 }

@@ -8,7 +8,7 @@ TRAMP.
 > The async `/relay:` file layer — browse, open, edit, save, dired, freshness
 > via FS watch, directory/content prefetch, streaming listings for large
 > directories — is working, tested over real SSH to a Linux host, and
-> exercised locally (no-SSH transport) on macOS. Alongside that, `relay-exec`
+> exercised locally (no-SSH transport) on macOS. Alongside that, `relay-exec-raw`
 > (see [Usage](#running-a-command-remotely) below) runs one argv command on
 > the remote host and blocks for its exit code plus captured stdout/stderr —
 > deliberately not the same thing as real `process-file`/`start-file-process`
@@ -266,12 +266,15 @@ destructive write.
 ### Running a command remotely
 
 ```elisp
-(relay-exec "ssh+HOST" '("tmux" "list-panes" "-a"))
+(relay-exec-text "ssh+HOST" '("tmux" "list-panes" "-a"))
 ;; => (:exit-code 0 :stdout "...\n" :stderr "")
 ```
 
-`relay-exec` runs one command on the server side and blocks until it exits
+`relay-exec-raw` runs one command on the server side and blocks until it exits
 (or times out), returning a plist of `:exit-code`, `:stdout`, and `:stderr`.
+The output values are exact unibyte strings. `relay-exec-text` is the
+UTF-8-decoding convenience wrapper for text commands. Both APIs cap combined
+captured output at 8 MiB; they are not a general-purpose file-transfer API.
 COMMAND is always an argv list — the program name, then its arguments — and
 is never interpreted through a shell on either end; there is no way to pass
 a shell string through this function. An optional third argument sets the
@@ -285,7 +288,9 @@ This requires a server advertising the `exec-v1` capability — reinstall via
 capability-mismatch message. It's a small, deliberately synchronous
 primitive (see the status note at the top of this document) — reach for it
 for short, well-defined commands, not anything that needs to stream output
-or run indefinitely.
+or run indefinitely. If the client times out or disconnects, the server kills
+the command's process group; malformed options and output over 8 MiB are
+rejected explicitly.
 
 ### Content-prefetch profiles
 

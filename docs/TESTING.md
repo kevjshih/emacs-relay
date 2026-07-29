@@ -77,13 +77,13 @@ The transport shells out to your system `ssh`, so `~/.ssh/config` (Host aliases,
 | open + revision-safe visited save + local transformed auto-save | implemented for regular UTF-8 files ≤16 MiB |
 | dired (`insert-directory`, including revert) | implemented |
 | file-notify / freshness | implemented (invalidate + deferred callback; coarse on overflow) |
-| `relay-exec` (synchronous, argv-only, one command in/exit+stdout+stderr out) | implemented |
+| `relay-exec-raw` / `relay-exec-text` (synchronous, argv-only, bounded output) | implemented |
 | `process-file`/`start-file-process` (streaming, async, interactive processes) / magit / grep | **not supported** (Milestone 1) |
 | binary merges, final symlinks, hardlinks, FIFOs/directories, large files | rejected for revision-safe replacement |
 
 ## Revision-safe save checks
 
-The client and server must be installed as a matching protocol-v2 pair.  The
+The client and server must be installed as a matching protocol-v1 pair.  The
 hello reply must include `revisions-v1`; otherwise Emacs reports that the server
 needs reinstalling.  For a local verification run, first build the server, then
 run the Rust and focused ERT suites from the repository root:
@@ -106,8 +106,9 @@ git diff --check
 The focused conflict suite covers BASE/LOCAL/REMOTE classification, conditional
 writes, conflict menu choices, independent Ediff snapshots, Auto-Revert enabled
 and disabled, server capability rejection, and uncertain transport outcomes.
-Current local green counts are Rust 25/25, legacy ERT 47/47, and focused
-conflict ERT 43/43, including runs against byte-compiled implementation code.
+Current local green counts are Rust 34/34, legacy ERT 47/47, conflict ERT
+45/45, and exec ERT 12/12, including runs against
+byte-compiled implementation code.
 
 For a manual local-server check, visit one tiny regular UTF-8 fixture in two
 buffers.  Save an edit in the first, then save a distinct edit in the second:

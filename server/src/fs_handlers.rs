@@ -7,11 +7,13 @@ use crate::revisions;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, Instant};
 
@@ -39,10 +41,24 @@ const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
 /// `timeout_ms` plus this small, fixed collection grace, not by however
 /// long a lingering grandchild lives.
 const EXEC_COLLECT_GRACE_MS: u64 = 100;
+const EXEC_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+
+pub(crate) type ExecRegistry = std::sync::Arc<std::sync::Mutex<HashSet<i32>>>;
+
+pub(crate) fn new_exec_registry() -> ExecRegistry {
+    std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn kill_registered_execs(registry: &ExecRegistry) {
+    let groups: Vec<i32> = registry.lock().unwrap().drain().collect();
+    for pgid in groups {
+        unsafe { let _ = libc::killpg(pgid, libc::SIGKILL); }
+    }
+}
 
 /// FS ops: run on their own thread (see main loop) so slow content ops never
 /// head-of-line-block metadata ops.
-pub(crate) fn handle_fs(req: &Value, tx: &SyncSender<Vec<u8>>) {
+pub(crate) fn handle_fs(req: &Value, tx: &SyncSender<Vec<u8>>, registry: &ExecRegistry) {
     let id = req.get("id").and_then(Value::as_i64).unwrap_or(0);
     let op = req.get("op").and_then(Value::as_str).unwrap_or("");
     let path = expand_home(req.get("path").and_then(Value::as_str).unwrap_or(""));
@@ -116,7 +132,7 @@ pub(crate) fn handle_fs(req: &Value, tx: &SyncSender<Vec<u8>>) {
         // process, so it deliberately does NOT take `_mutation_guard`
         // (that lock exists to serialize filesystem-mutation ops against
         // the revision-tracking system; orthogonal here).
-        "exec" => exec_command(req),
+        "exec" => exec_command_with_registry(req, registry),
         "write" => {
             let b64 = req.get("bytes_b64").and_then(Value::as_str).unwrap_or("");
             let append = req.get("append").and_then(Value::as_bool).unwrap_or(false);
@@ -363,7 +379,72 @@ fn resolve(path: &str) -> Result<Value, String> {
 /// unconditional `join`), so total time is bounded by `timeout_ms` plus
 /// that small fixed grace — not by however long a lingering grandchild
 /// lives — on both the timeout and success paths.
+#[cfg(test)]
 fn exec_command(req: &Value) -> Result<Value, String> {
+    exec_command_with_registry(req, &new_exec_registry())
+}
+
+// Removal (Drop, below) always runs after the child has been wait()/try_wait()-
+// reaped, so it never races a still-live process of ITS OWN. What it can't
+// close is classic PID/PGID-reuse TOCTOU: `kill_registered_execs` signals by
+// raw pgid (no pidfd/liveness generation check), so if the OS recycles a
+// just-reaped pgid to an unrelated process inside the brief window between
+// reaping and this Drop firing, and shutdown lands in that same window, it
+// could in principle killpg a group this server no longer owns. Considered
+// acceptable: kill_registered_execs runs once, at shutdown, and real pid
+// allocators don't recycle within microseconds under normal load.
+struct ExecRegistration {
+    registry: ExecRegistry,
+    pgid: i32,
+}
+
+fn spawn_output_reader<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    used: &std::sync::Arc<AtomicUsize>,
+    overflow: &std::sync::Arc<AtomicBool>,
+    tx: mpsc::Sender<Result<Vec<u8>, String>>,
+) -> std::thread::JoinHandle<()> {
+    let used = std::sync::Arc::clone(used);
+    let overflow = std::sync::Arc::clone(overflow);
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let Some(mut pipe) = pipe else {
+            let _ = tx.send(Ok(buf));
+            return;
+        };
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let total = used.fetch_add(n, Ordering::AcqRel) + n;
+                    if total > EXEC_OUTPUT_LIMIT {
+                        overflow.store(true, Ordering::Release);
+                        let _ = tx.send(Err(format!(
+                            "exec: output exceeded {} bytes, process group killed",
+                            EXEC_OUTPUT_LIMIT
+                        )));
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(format!("exec: output read failed: {error}")));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Ok(buf));
+    })
+}
+
+impl Drop for ExecRegistration {
+    fn drop(&mut self) {
+        self.registry.lock().unwrap().remove(&self.pgid);
+    }
+}
+
+fn exec_command_with_registry(req: &Value, registry: &ExecRegistry) -> Result<Value, String> {
     let command = req
         .get("command")
         .and_then(Value::as_array)
@@ -377,14 +458,20 @@ fn exec_command(req: &Value) -> Result<Value, String> {
         .collect::<Option<Vec<String>>>()
         .ok_or_else(|| "exec: \"command\" must be an array of strings".to_string())?;
 
-    let timeout_ms = req
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS);
+    let timeout_ms = match req.get("timeout_ms") {
+        None => DEFAULT_EXEC_TIMEOUT_MS,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "exec: \"timeout_ms\" must be a positive integer".to_string())?,
+    };
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    if let Some(cwd) = req.get("cwd").and_then(Value::as_str) {
+    if let Some(cwd_value) = req.get("cwd") {
+        let cwd = cwd_value
+            .as_str()
+            .ok_or_else(|| "exec: \"cwd\" must be a string".to_string())?;
         cmd.current_dir(expand_home(cwd));
     }
     // Explicit, not incidental: `Command`'s default is to *inherit* the
@@ -398,9 +485,27 @@ fn exec_command(req: &Value) -> Result<Value, String> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("exec: spawn failed: {e}"))?;
+    let _registration = ExecRegistration {
+        registry: std::sync::Arc::clone(registry),
+        pgid: child.id() as i32,
+    };
+    registry.lock().unwrap().insert(child.id() as i32);
 
     // Drain stdout/stderr on their own threads, concurrently with the
     // try_wait poll loop below, rather than reading only after the child
@@ -415,24 +520,12 @@ fn exec_command(req: &Value) -> Result<Value, String> {
     // timeout budget) instead of an unconditional, unbounded `join` — see
     // the success path below, which needs exactly that to stay bounded
     // when a grandchild is still holding the pipe open.
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    let used = std::sync::Arc::new(AtomicUsize::new(0));
+    let overflow = std::sync::Arc::new(AtomicBool::new(false));
     let (stdout_tx, stdout_rx) = mpsc::channel();
     let (stderr_tx, stderr_rx) = mpsc::channel();
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        let _ = stdout_tx.send(buf);
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        let _ = stderr_tx.send(buf);
-    });
+    let stdout_thread = spawn_output_reader(child.stdout.take(), &used, &overflow, stdout_tx);
+    let stderr_thread = spawn_output_reader(child.stderr.take(), &used, &overflow, stderr_tx);
 
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
@@ -440,15 +533,20 @@ fn exec_command(req: &Value) -> Result<Value, String> {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
+                if overflow.load(Ordering::Acquire) {
+                    kill_process_group(&mut child);
+                    let _ = child.wait();
+                    return Err(format!("exec: output exceeded {} bytes, process group killed", EXEC_OUTPUT_LIMIT));
+                }
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
+                    kill_process_group(&mut child);
                     let _ = child.wait();
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
-                let _ = child.kill();
+                kill_process_group(&mut child);
                 let _ = child.wait();
                 return Err(format!("exec: wait failed: {e}"));
             }
@@ -492,7 +590,8 @@ fn exec_command(req: &Value) -> Result<Value, String> {
         .saturating_sub(start.elapsed())
         .max(Duration::from_millis(EXEC_COLLECT_GRACE_MS));
     let stdout = match stdout_rx.recv_timeout(remaining) {
-        Ok(buf) => buf,
+        Ok(Ok(buf)) => buf,
+        Ok(Err(error)) => return Err(error),
         Err(_) => {
             return Err(format!("exec: timed out after {timeout_ms}ms, process killed"));
         }
@@ -501,7 +600,8 @@ fn exec_command(req: &Value) -> Result<Value, String> {
         .saturating_sub(start.elapsed())
         .max(Duration::from_millis(EXEC_COLLECT_GRACE_MS));
     let stderr = match stderr_rx.recv_timeout(remaining) {
-        Ok(buf) => buf,
+        Ok(Ok(buf)) => buf,
+        Ok(Err(error)) => return Err(error),
         Err(_) => {
             return Err(format!("exec: timed out after {timeout_ms}ms, process killed"));
         }
@@ -517,6 +617,15 @@ fn exec_command(req: &Value) -> Result<Value, String> {
         "stdout_b64": B64.encode(&stdout),
         "stderr_b64": B64.encode(&stderr),
     }))
+}
+
+#[cfg(unix)]
+fn kill_process_group(child: &mut Child) {
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        let _ = libc::killpg(pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
 }
 
 fn write_file(path: &str, b64: &str, append: bool, must_be_new: bool) -> Result<(), String> {
@@ -613,6 +722,54 @@ mod tests {
         assert!(exec_command(&json!({"command": []})).is_err());
         assert!(exec_command(&json!({"command": "echo hi"})).is_err());
         assert!(exec_command(&json!({"command": ["echo", 1]})).is_err());
+        assert!(exec_command(&json!({"command": ["true"], "timeout_ms": 0})).is_err());
+        assert!(exec_command(&json!({"command": ["true"], "timeout_ms": -1})).is_err());
+        assert!(exec_command(&json!({"command": ["true"], "cwd": 7})).is_err());
+    }
+
+    #[test]
+    fn exec_bounds_combined_output_and_reports_a_clear_error() {
+        let req = json!({
+            "command": ["sh", "-c", "head -c 9000000 /dev/zero"],
+            "timeout_ms": 3000
+        });
+        let result = exec_command(&req);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("output exceeded"));
+    }
+
+    #[test]
+    fn exec_registry_is_empty_after_a_completed_command() {
+        let registry = new_exec_registry();
+        let result = exec_command_with_registry(&json!({"command": ["true"]}), &registry);
+        assert!(result.is_ok());
+        assert!(registry.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn killing_registered_execs_stops_an_inflight_command() {
+        let registry = new_exec_registry();
+        let worker_registry = std::sync::Arc::clone(&registry);
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_started = std::sync::Arc::clone(&started);
+        let worker = std::thread::spawn(move || {
+            worker_started.wait();
+            exec_command_with_registry(
+                &json!({"command": ["sleep", "5"], "timeout_ms": 10000}),
+                &worker_registry,
+            )
+        });
+        started.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while registry.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!registry.lock().unwrap().is_empty());
+        kill_registered_execs(&registry);
+        let result = worker.join().unwrap();
+        assert!(result.is_ok());
+        assert!(result.unwrap()["exit_code"].is_null());
+        assert!(registry.lock().unwrap().is_empty());
     }
 
     #[test]

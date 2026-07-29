@@ -38,7 +38,7 @@ use notify::EventKind;
 use serde_json::{json, Value};
 
 use control::handle_ctl;
-use fs_handlers::handle_fs;
+use fs_handlers::{handle_fs, kill_registered_execs, new_exec_registry};
 use framing::frame_size_allowed;
 
 const WRITER_QUEUE_CAPACITY: usize = 64;
@@ -66,16 +66,18 @@ fn main() {
     // each worker releases it before doing filesystem I/O.
     let (fs_tx, fs_rx) = sync_channel::<Value>(FS_JOB_QUEUE_CAPACITY);
     let fs_rx = Arc::new(Mutex::new(fs_rx));
+    let exec_registry = new_exec_registry();
     let mut _workers = Vec::with_capacity(FS_WORKER_COUNT);
     for _ in 0..FS_WORKER_COUNT {
         let fs_rx = Arc::clone(&fs_rx);
         let tx = tx.clone();
+        let exec_registry = Arc::clone(&exec_registry);
         _workers.push(thread::spawn(move || loop {
             let req = match fs_rx.lock().unwrap().recv() {
                 Ok(req) => req,
                 Err(_) => break,
             };
-            handle_fs(&req, &tx);
+            handle_fs(&req, &tx, &exec_registry);
         }));
     }
 
@@ -194,4 +196,5 @@ fn main() {
     // a FIFO or an unavailable mount could otherwise orphan this per-connection
     // server indefinitely.  Dropping JoinHandles detaches the threads; return
     // from main terminates the process and lets the OS release all resources.
+    kill_registered_execs(&exec_registry);
 }

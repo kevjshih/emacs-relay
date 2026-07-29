@@ -54,7 +54,7 @@ if BODY errors."
   "A successful command reports exit code 0 and its stdout."
   (relay-exec-test--with-local-conn conn
     (ignore conn)
-    (let ((result (relay-exec "local" '("echo" "hello-from-relay-exec"))))
+    (let ((result (relay-exec-text "local" '("echo" "hello-from-relay-exec"))))
       (should (equal (plist-get result :exit-code) 0))
       (should (string-match-p "hello-from-relay-exec" (plist-get result :stdout))))))
 
@@ -64,19 +64,34 @@ Lisp error -- callers need the real exit code (e.g. to distinguish `grep'
 finding nothing from `grep' actually failing)."
   (relay-exec-test--with-local-conn conn
     (ignore conn)
-    (let ((result (relay-exec "local" '("sh" "-c" "exit 7"))))
+    (let ((result (relay-exec-raw "local" '("sh" "-c" "exit 7"))))
       (should (equal (plist-get result :exit-code) 7)))))
 
 (ert-deftest relay-exec-captures-stdout-and-stderr-separately ()
   "stdout and stderr must not be mixed together in either direction."
   (relay-exec-test--with-local-conn conn
     (ignore conn)
-    (let ((result (relay-exec
+    (let ((result (relay-exec-text
                    "local" '("sh" "-c" "echo out-text; echo err-text 1>&2"))))
       (should (string-match-p "out-text" (plist-get result :stdout)))
       (should-not (string-match-p "err-text" (plist-get result :stdout)))
       (should (string-match-p "err-text" (plist-get result :stderr)))
       (should-not (string-match-p "out-text" (plist-get result :stderr))))))
+
+(ert-deftest relay-exec-raw-preserves-non-utf8-bytes ()
+  "The raw API returns exact unibyte output without text conversion."
+  (relay-exec-test--with-local-conn conn
+    (ignore conn)
+    (let ((result (relay-exec-raw "local" '("sh" "-c" "printf '\\377'"))))
+      (should (= (length (plist-get result :stdout)) 1))
+      (should (= (aref (plist-get result :stdout) 0) 255)))))
+
+(ert-deftest relay-exec-text-decodes-utf8-output ()
+  "The text API is an explicit UTF-8 convenience layer."
+  (relay-exec-test--with-local-conn conn
+    (ignore conn)
+    (let ((result (relay-exec-text "local" '("printf" "hello"))))
+      (should (equal (plist-get result :stdout) "hello")))))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Client-side validation (no RPC / no server needed).
@@ -85,9 +100,29 @@ finding nothing from `grep' actually failing)."
   "Client-side validation must reject before any request is even attempted --
 proven here by never establishing a connection at all (`relay--connection'
 would error on the bogus \"no-such-authority\" if this ever got that far)."
-  (should-error (relay-exec "no-such-authority" nil))
-  (should-error (relay-exec "no-such-authority" '(42)))
-  (should-error (relay-exec "no-such-authority" "echo hi")))
+  (should-error (relay-exec-raw "no-such-authority" nil))
+  (should-error (relay-exec-raw "no-such-authority" '(42)))
+  (should-error (relay-exec-raw "no-such-authority" "echo hi")))
+
+(ert-deftest relay-exec-rejects-invalid-options-without-a-round-trip ()
+  (should-error (relay-exec-raw "no-such-authority" '("true") nil 0))
+  (should-error (relay-exec-raw "no-such-authority" '("true") nil -1))
+  (should-error (relay-exec-raw "no-such-authority" '("true") 7)))
+
+(ert-deftest relay-exec-abort-closes-the-connection-and-removes-it ()
+  "A client-side abort must close the transport used by the server exec."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (conn (relay-exec-test--conn))
+         (proc (start-process "relay-exec-abort-test" nil "sleep" "10")))
+    (setf (relay-conn-process conn) proc)
+    (puthash "local" conn relay--connections)
+    (unwind-protect
+        (progn
+          (relay--exec-abort-connection conn)
+          (should-not (process-live-p proc))
+          (should-not (gethash "local" relay--connections)))
+      (when (process-live-p proc)
+        (delete-process proc)))))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Capability gating -- exercised without any wire I/O, via a bare
@@ -108,7 +143,7 @@ deep inside the server, and never a hang."
     (cl-letf (((symbol-function 'relay--connection) (lambda (&rest _) conn))
               ((symbol-function 'relay--request)
                (lambda (&rest _) (ert-fail "must not send a request without exec-v1"))))
-      (let ((err (should-error (relay-exec "local" '("echo" "hi")))))
+      (let ((err (should-error (relay-exec-raw "local" '("echo" "hi")))))
         (should (string-match-p "does not support exec" (error-message-string err)))))))
 
 (ert-deftest relay-exec-proceeds-when-the-server-advertises-the-capability ()
@@ -124,9 +159,9 @@ no-wire unit test)."
                (lambda (_conn _op &rest args)
                  (setq captured args)
                  (list :ok t :exit_code 0 :stdout_b64 "" :stderr_b64 ""))))
-      (relay-exec "local" '("echo" "hi"))
+      (relay-exec-raw "local" '("echo" "hi"))
       ;; Sent as a vector, not a list: `json-serialize' treats a plain Lisp
-      ;; list as a candidate JSON object, so `relay-exec' converts COMMAND
+      ;; list as a candidate JSON object, so `relay-exec-raw' converts COMMAND
       ;; at the wire boundary (see its own comment) -- this assertion is
       ;; what actually caught that bug during development.
       (should (equal (plist-get captured :command) ["echo" "hi"]))
@@ -136,7 +171,7 @@ no-wire unit test)."
 
 (ert-deftest relay-exec-widens-the-client-wait-to-fit-an-explicit-timeout-ms ()
   "An explicit TIMEOUT-MS above the ordinary `relay-request-timeout' must not
-make `relay-exec' give up client-side before the server's own \"timed out\"
+make `relay-exec-raw' give up client-side before the server's own \"timed out\"
 error could possibly come back -- otherwise the caller only ever sees a
 generic client timeout and the server's specific message is unreachable."
   (let ((conn (relay-exec-test--conn)) captured-timeout)
@@ -148,7 +183,7 @@ generic client timeout and the server's specific message is unreachable."
                  (setq captured-timeout relay-request-timeout)
                  (list :ok t :exit_code 0 :stdout_b64 "" :stderr_b64 ""))))
       (let ((relay-request-timeout 30.0))
-        (relay-exec "local" '("echo" "hi") nil 60000)
+        (relay-exec-raw "local" '("echo" "hi") nil 60000)
         (should (= captured-timeout 62.0))))))
 
 ;;;; ---------------------------------------------------------------------------
@@ -162,7 +197,7 @@ server's own clear timeout error -- proving the widened client-side wait
 rather than the call hanging or a generic client timeout firing first."
   (relay-exec-test--with-local-conn conn
     (ignore conn)
-    (let ((err (should-error (relay-exec "local" '("sleep" "5") nil 300))))
+    (let ((err (should-error (relay-exec-raw "local" '("sleep" "5") nil 300))))
       (should (string-match-p "timed out" (error-message-string err))))))
 
 (provide 'relay-exec-tests)

@@ -119,8 +119,9 @@ cargo build --release
 ```
 
 A local build is what you want for the `local` transport (`relay-server-local-path`,
-used for no-SSH smoke testing — see [`docs/TESTING.md`](./docs/TESTING.md)) and
-for development. To get a binary that runs on a **different** host's OS/CPU
+used for no-SSH smoke testing — see [`docs/TESTING.md`](./docs/TESTING.md) — and
+for any other caller that connects via `local`, e.g. `relay-exec-raw`/`relay-exec-text`
+run against this machine) and for development. To get a binary that runs on a **different** host's OS/CPU
 architecture, use the cross-compiling install script in the next step instead of
 a plain `cargo build`.
 
@@ -323,7 +324,7 @@ automatically to a `default` profile on its next load/save.
 | Variable | Default | Purpose |
 |---|---|---|
 | `relay-server-remote-path` | `"~/.cache/relay/relay-server"` | Remote server path, as installed by `scripts/install-server.sh` |
-| `relay-server-local-path` | `"relay-server"` | Server binary path for the `local` (no-SSH) test transport |
+| `relay-server-local-path` | `"relay-server"` | Server binary path for the `local` (no-SSH) transport — used for smoke testing, and for *any* caller that connects via authority `"local"` (e.g. `relay-exec-raw`/`relay-exec-text` run against the local machine). The default is a bare name, not a path, and won't be found on `$PATH`; leaving it unset makes every `local`-authority call fail silently. Point it at your build, e.g. `server/target/release/relay-server`. |
 | `relay-request-timeout` | `30.0` | Seconds to wait for a synchronous server reply before erroring |
 | `relay-max-frame-bytes` | 32 MiB | Largest protocol frame accepted from a server, guarding against a malformed/incompatible peer |
 | `relay-content-prefetch` | `nil` | Enable opt-in content prefetch (see above) |

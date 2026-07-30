@@ -373,6 +373,122 @@
     (should (equal async-result failure))
     (should (equal stream-result failure))))
 
+(defun relay-test--frame (plist)
+  "Return one length-prefixed protocol frame encoding PLIST, matching
+`relay--send's wire format, for feeding directly to `relay--filter' in tests."
+  (let* ((payload (encode-coding-string (json-serialize plist) 'utf-8))
+         (len (length payload)))
+    (concat (unibyte-string (logand len #xff)
+                            (logand (ash len -8) #xff)
+                            (logand (ash len -16) #xff)
+                            (logand (ash len -24) #xff))
+            payload)))
+
+(ert-deftest relay-async-callback-does-not-run-while-a-sync-request-is-blocked ()
+  "A callback queued for CONN while another request on the same CONN is still
+`waiting' (a blocked synchronous `relay--request') must not run until that
+synchronous request resolves -- otherwise application code would re-enter
+Emacs's single Lisp thread underneath the blocked wait (the hazard
+`relay--drain-callback-queue's header comment describes)."
+  (let* ((conn (relay-test--conn))
+         (pending (relay-conn-pending conn))
+         (ran nil))
+    (puthash 1 'waiting pending)
+    (relay--enqueue-callback conn (lambda () (setq ran t)))
+    ;; Pump real timers: the queued callback must stay blocked behind the
+    ;; still-`waiting' request rather than running.
+    (let ((deadline (+ (float-time) 0.3)))
+      (while (< (float-time) deadline) (sleep-for 0.02)))
+    (should-not ran)
+    ;; Resolving the blocked request must let the queued callback through.
+    (remhash 1 pending)
+    (let ((deadline (+ (float-time) 2.0)))
+      (while (and (not ran) (< (float-time) deadline)) (sleep-for 0.02)))
+    (should ran)))
+
+(ert-deftest relay-slow-async-callback-does-not-block-ingestion-of-a-second-frame-in-the-same-chunk ()
+  "Two replies arriving in one process-filter chunk must both be parsed and
+routed before either callback runs -- a slow callback for the first must not
+delay recognizing the second.
+
+This is the specific, single-thread-compatible sense in which callbacks no
+longer block frame ingestion: it does not mean two callbacks run
+concurrently (Emacs Lisp has no concurrency), only that parsing/routing of
+already-received bytes no longer waits on a callback's completion. Event
+dispatch (`relay--handle-event') is unaffected by this change and remains
+inline -- a slow event handler can still block ingestion; only reply/stream
+callbacks were moved off the filter."
+  (let* ((conn (relay-test--conn))
+         (proc (make-pipe-process :name "relay-ingestion-test" :noquery t))
+         (order nil)
+         (id2-already-routed-when-id1-ran nil))
+    (unwind-protect
+        (progn
+          (process-put proc 'relay-conn conn)
+          (puthash 1 (lambda (_msg)
+                       (push 'id1 order)
+                       ;; If id2's frame had to wait for this callback, its
+                       ;; entry would still be the pending function we
+                       ;; installed below, not yet removed.
+                       (setq id2-already-routed-when-id1-ran
+                             (null (gethash 2 (relay-conn-pending conn)))))
+                   (relay-conn-pending conn))
+          (puthash 2 (lambda (_msg) (push 'id2 order)) (relay-conn-pending conn))
+          (relay--filter proc (concat (relay-test--frame '(:id 1 :ok t))
+                                      (relay-test--frame '(:id 2 :ok t))))
+          (let ((deadline (+ (float-time) 2.0)))
+            (while (and (< (length order) 2) (< (float-time) deadline))
+              (sleep-for 0.02)))
+          (should id2-already-routed-when-id1-ran)
+          ;; Order is still preserved (FIFO) even though both were deferred.
+          (should (equal (reverse order) '(id1 id2))))
+      (when (process-live-p proc) (delete-process proc)))))
+
+(ert-deftest relay-cancel-request-makes-a-later-reply-a-no-op ()
+  "After `relay--cancel-request', a reply for that id must not invoke the
+callback that was registered for it -- the same silent-drop behavior as any
+reply for an id relay never issued."
+  (let* ((conn (relay-test--conn))
+         (ran nil)
+         (id (progn (puthash 1 (lambda (_msg) (setq ran t)) (relay-conn-pending conn))
+                    1)))
+    (relay--cancel-request conn id)
+    (should-not (gethash id (relay-conn-pending conn)))
+    ;; Cancelling twice, or an id nothing ever registered, must not error.
+    (relay--cancel-request conn id)
+    (relay--cancel-request conn 999)
+    ;; A "late reply" for the cancelled id, routed exactly as relay--dispatch
+    ;; would route it, finds nothing pending and is a no-op.
+    (let ((entry (gethash id (relay-conn-pending conn))))
+      (should-not (functionp entry)))
+    (should-not ran)))
+
+(ert-deftest relay-request-async-timeout-synthesizes-a-failure-and-cancels-the-id ()
+  "TIMEOUT on `relay--request-async' fires a synthetic failure when no real
+reply arrives in time, and the id is no longer pending afterward (so a real
+reply that does eventually arrive is silently dropped, per
+`relay--cancel-request')."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (proc (make-pipe-process :name "relay-timeout-test" :noquery t))
+         (conn (relay--make-conn :process proc :authority "timeout-test"))
+         (result nil)
+         (id nil))
+    (unwind-protect
+        (progn
+          (process-put proc 'relay-conn conn)
+          ;; Never replied to: only the timeout can resolve this request.
+          (setq id (relay--request-async conn "hello" nil
+                                         (lambda (reply) (setq result reply))
+                                         0.1))
+          (let ((deadline (+ (float-time) 2.0)))
+            (while (and (not result) (< (float-time) deadline))
+              (sleep-for 0.02)))
+          (should result)
+          (should-not (plist-get result :ok))
+          (should (plist-get result :timeout))
+          (should-not (gethash id (relay-conn-pending conn))))
+      (when (process-live-p proc) (delete-process proc)))))
+
 (ert-deftest relay-old-sentinel-cannot-remove-newer-reconnection ()
   "A late exit from an old SSH process must preserve its replacement."
   (let* ((relay--connections (make-hash-table :test 'equal))
@@ -804,5 +920,147 @@ bounded work queue, and writer backpressure without creating remote load."
                (lambda (_conn op _args _callback) (push op async-ops))))
       (relay--h-file-notify-rm-watch descriptor))
     (should (member "unwatch" async-ops))))
+
+;;;; ---------------------------------------------------------------------------
+;;;; Async connection establishment
+
+(ert-deftest relay-connect-async-succeeds-against-a-real-local-server ()
+  "A successful async connection fires on-ready with a ready relay-conn."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (done nil)
+         (conn-result nil)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          (relay-connect-async "local"
+                               (lambda (conn)
+                                 (setq conn-result conn done t))
+                               (lambda (err) (setq done t)))
+          ;; Wait for the callback to fire.
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should conn-result)
+          (should (relay-conn-ready conn-result))
+          (should (relay-conn-hello conn-result))
+          (should (process-live-p (relay-conn-process conn-result))))
+      ;; Cleanup
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c)))))))
+
+(ert-deftest relay-connect-async-succeeds-for-an-authority-already-connected-synchronously ()
+  "`relay-connect-async' must recognize a connection `relay--connection'
+already established synchronously as ready, and call on-ready promptly --
+not silently hang forever.
+
+This is the exact sequence a real caller produces: something on a
+synchronous path (e.g. `relay-exec-raw' via `muster-chat-tmux--send-keys')
+connects an authority first, then something else calls
+`relay-connect-async' for that same authority. If the synchronous path ever
+stopped setting `relay-conn-ready', this would regress silently: every other
+async test in this file starts from a fresh `relay--connections' table, so
+none of them exercise a pre-existing synchronously-established connection."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (sync-conn (relay--connection "local"))
+         (done nil)
+         (conn-result nil)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          (should (relay-conn-ready sync-conn))
+          (relay-connect-async "local"
+                               (lambda (conn) (setq conn-result conn done t))
+                               (lambda (_err) (setq done t)))
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should (eq conn-result sync-conn)))
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c)))))))
+
+(ert-deftest relay-connect-async-fans-concurrent-callers-to-one-connect ()
+  "Two concurrent relay-connect-async calls for the same authority spawn exactly
+one process and both callbacks receive the same relay-conn object."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (orig (symbol-function 'make-process))
+         (spawns 0)
+         (ready-count 0)
+         (conns '())
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          ;; Count process spawns via a wrapper.
+          (cl-letf (((symbol-function 'make-process)
+                     (lambda (&rest args) (cl-incf spawns) (apply orig args))))
+            ;; Issue two relay-connect-async calls back-to-back (no event loop
+            ;; between them) for the same authority.
+            (relay-connect-async "local"
+                                 (lambda (conn) (push conn conns) (cl-incf ready-count))
+                                 #'ignore)
+            (relay-connect-async "local"
+                                 (lambda (conn) (push conn conns) (cl-incf ready-count))
+                                 #'ignore)
+            ;; Wait for both callbacks to fire.
+            (while (and (< ready-count 2) (< (float-time) deadline))
+              (sleep-for 0.02)))
+          ;; Assertions: exactly one spawn, both conns are eq and ready.
+          (should (= spawns 1))
+          (should (= ready-count 2))
+          (should (= (length conns) 2))
+          (should (eq (car conns) (cadr conns)))
+          (should (relay-conn-ready (car conns))))
+      ;; Cleanup
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c)))))))
+
+(ert-deftest relay-connect-async-calls-on-error-for-a-bad-authority ()
+  "An unknown transport (bad authority) fires on-error asynchronously."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (done nil)
+         (error-result nil)
+         (deadline (+ (float-time) 1.0)))
+    (relay-connect-async "no-such-authority"
+                         (lambda (_conn) (setq done t))
+                         (lambda (err) (setq error-result err done t)))
+    ;; Wait for the callback to fire.
+    (while (and (not done) (< (float-time) deadline))
+      (sleep-for 0.02))
+    (should done)
+    (should-not (gethash "no-such-authority" relay--connections))
+    (should error-result)
+    (should (plist-get error-result :error))))
+
+(ert-deftest relay-connect-async-calls-on-error-when-transport-dies ()
+  "If the server process exits immediately (e.g., binary not found or 'false'),
+on-error is called asynchronously with a transport error."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path (executable-find "false"))
+         (done nil)
+         (error-result nil)
+         (deadline (+ (float-time) 2.0)))
+    (unwind-protect
+        (progn
+          (relay-connect-async "local"
+                               (lambda (_conn) (setq done t))
+                               (lambda (err) (setq error-result err done t)))
+          ;; Wait for the callback to fire (the false process dies instantly).
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should error-result)
+          (should (plist-get error-result :error)))
+      ;; Cleanup
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c)))))))
 
 ;;; relay-tests.el ends here

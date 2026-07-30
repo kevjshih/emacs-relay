@@ -114,5 +114,81 @@ This is the text-oriented convenience wrapper around `relay-exec-raw'."
           :stdout (decode-coding-string (plist-get result :stdout) 'utf-8)
           :stderr (decode-coding-string (plist-get result :stderr) 'utf-8))))
 
+;;;; ---------------------------------------------------------------------------
+;;;; Async command execution
+
+(defun relay-exec-raw-async (authority command on-success on-error &optional cwd timeout-ms)
+  "Async counterpart to `relay-exec-raw'. Never blocks.
+
+ON-SUCCESS is called with the same plist `relay-exec-raw' returns:
+`(:exit-code N :stdout BYTES :stderr BYTES)'. ON-ERROR is called
+asynchronously with a failure plist for a connection failure, a missing
+exec-v1 capability, or the request itself failing. COMMAND/CWD/TIMEOUT-MS
+are still validated synchronously and signal an ordinary Lisp error
+immediately, exactly like `relay-exec-raw' -- ON-ERROR is never called for
+that case, only for failures reached after this function has already
+returned.
+
+Returns nil; this is a purely callback-based API."
+  ;; Validate COMMAND/CWD/TIMEOUT-MS synchronously up front.
+  ;; These can signal, but they're pure argument checks (no async contract violation).
+  (relay--exec-validate-command command)
+  (relay--exec-validate-options cwd timeout-ms)
+
+  ;; Use relay-connect-async to get a ready connection, then send the exec request.
+  (relay-connect-async
+   authority
+   (lambda (conn)
+     ;; Connection is ready; check the exec-v1 capability.
+     (let ((hello (relay-conn-hello conn)))
+       (if (member "exec-v1" (plist-get hello :capabilities))
+           ;; Has exec-v1: build args and send the exec request.
+           (let* ((args (append (list :command (vconcat command))
+                                (when cwd (list :cwd cwd))
+                                (when timeout-ms (list :timeout_ms timeout-ms))))
+                  ;; Calculate the timeout for relay--request-async: add 2s cushion
+                  ;; to the server timeout, or nil if no explicit timeout-ms.
+                  (req-timeout (and timeout-ms (+ 2.0 (/ timeout-ms 1000.0)))))
+             ;; Send the exec request and handle the reply.
+             (relay--request-async
+              conn "exec" args
+              (lambda (reply)
+                (if (plist-get reply :ok)
+                    ;; Success: build the result plist and call on-success.
+                    (funcall on-success
+                             (list :exit-code (plist-get reply :exit_code)
+                                   :stdout (base64-decode-string (or (plist-get reply :stdout_b64) ""))
+                                   :stderr (base64-decode-string (or (plist-get reply :stderr_b64) ""))))
+                  ;; Request failed: normalize error to plist and call on-error.
+                  (funcall on-error (list :ok nil :error (plist-get reply :error)))))
+              req-timeout))
+         ;; Missing exec-v1 capability: call on-error asynchronously.
+         (run-at-time 0 nil on-error
+                      (list :ok nil
+                            :error (format "relay-exec-raw-async: server for %s does not support exec (capabilities: %S) -- rebuild/reinstall relay-server via scripts/install-server.sh"
+                                           authority (plist-get hello :capabilities)))))))
+   ;; If relay-connect-async's on-error fires (connection failed), call our on-error.
+   (lambda (failure)
+     (funcall on-error failure)))
+  nil)
+
+(defun relay-exec-text-async (authority command on-success on-error &optional cwd timeout-ms)
+  "Async counterpart to `relay-exec-text' -- decodes stdout/stderr as UTF-8.
+
+Text-oriented convenience wrapper around `relay-exec-raw-async'.
+ON-SUCCESS is called with a plist whose :stdout and :stderr are decoded as UTF-8.
+ON-ERROR is called if any error occurs (see `relay-exec-raw-async')."
+  (relay-exec-raw-async
+   authority command
+   (lambda (result)
+     ;; Decode stdout/stderr as UTF-8 and call on-success with the text result.
+     (funcall on-success
+              (list :exit-code (plist-get result :exit-code)
+                    :stdout (decode-coding-string (plist-get result :stdout) 'utf-8)
+                    :stderr (decode-coding-string (plist-get result :stderr) 'utf-8))))
+   on-error
+   cwd timeout-ms)
+  nil)
+
 (provide 'relay-exec)
 ;;; relay-exec.el ends here

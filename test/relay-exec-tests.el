@@ -200,5 +200,102 @@ rather than the call hanging or a generic client timeout firing first."
     (let ((err (should-error (relay-exec-raw "local" '("sleep" "5") nil 300))))
       (should (string-match-p "timed out" (error-message-string err))))))
 
+;;;; ---------------------------------------------------------------------------
+;;;; Async command execution
+
+(ert-deftest relay-exec-raw-async-runs-a-command-and-returns-its-result ()
+  "An async command execution against the real server returns the same result
+shape as the synchronous version."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path relay-exec-test--server-path)
+         (done nil)
+         (result nil)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          (relay-exec-raw-async "local"
+                                '("echo" "hello-from-async")
+                                (lambda (res) (setq result res done t))
+                                (lambda (_err) (setq done t)))
+          ;; Wait for the callback to fire.
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should result)
+          (should (= (plist-get result :exit-code) 0))
+          (should (string-match-p "hello-from-async" (plist-get result :stdout))))
+      ;; Cleanup
+      (dolist (c (relay-exec-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c)))))))
+
+(ert-deftest relay-exec-raw-async-rejects-an-empty-command-without-async-roundtrip ()
+  "Client-side validation (COMMAND validation) must signal synchronously,
+not go through on-error asynchronously."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (error-fired nil))
+    ;; This should signal synchronously, never calling on-error later.
+    (should-error (relay-exec-raw-async "no-such-authority"
+                                         nil
+                                         (lambda (_res) nil)
+                                         (lambda (_err) (setq error-fired t))))
+    ;; Give timers a chance to run if the function were broken.
+    (sleep-for 0.05)
+    (should-not error-fired)))
+
+(ert-deftest relay-exec-raw-async-calls-on-error-when-exec-v1-missing ()
+  "If the server lacks exec-v1, on-error is called asynchronously (after
+connecting succeeds)."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (conn (relay-exec-test--conn))
+         (proc (start-process "relay-exec-test-no-exec" nil "sleep" "10"))
+         (done nil)
+         (error-result nil)
+         (deadline (+ (float-time) 1.0)))
+    (unwind-protect
+        (progn
+          (setf (relay-conn-process conn) proc)
+          (setf (relay-conn-hello conn)
+                (list :server_version "0.0.1" :protocol_version 1
+                      :capabilities '("revisions-v1")))
+          (setf (relay-conn-ready conn) t)
+          (puthash "test-no-exec" conn relay--connections)
+          (relay-exec-raw-async "test-no-exec"
+                                '("echo" "hi")
+                                (lambda (_res) (setq done t))
+                                (lambda (err) (setq error-result err done t)))
+          ;; Wait for the callback to fire.
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should error-result)
+          (should (string-match-p "does not support exec" (plist-get error-result :error))))
+      (when (process-live-p proc)
+        (delete-process proc)))))
+
+(ert-deftest relay-exec-text-async-decodes-utf8-output ()
+  "The async text API decodes stdout/stderr as UTF-8, same as the sync version."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path relay-exec-test--server-path)
+         (done nil)
+         (result nil)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          (relay-exec-text-async "local"
+                                 '("printf" "hello")
+                                 (lambda (res) (setq result res done t))
+                                 (lambda (_err) (setq done t)))
+          ;; Wait for the callback to fire.
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should result)
+          (should (equal (plist-get result :stdout) "hello")))
+      ;; Cleanup
+      (dolist (c (relay-exec-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c)))))))
+
 (provide 'relay-exec-tests)
 ;;; relay-exec-tests.el ends here

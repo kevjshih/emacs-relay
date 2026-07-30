@@ -63,6 +63,14 @@ from making the process filter retain an unbounded partial reply.  It matches
 the server's protocol limit by default."
   :type 'integer :group 'relay)
 
+(defcustom relay-callback-queue-max-length 10000
+  "Maximum callbacks a connection may have queued awaiting execution.
+
+Bounds unbounded growth if a peer replies faster than callbacks can run (or a
+callback never returns). Exceeding it closes the connection outright, the
+same as an oversized frame."
+  :type 'integer :group 'relay)
+
 (defconst relay-protocol-version 1)
 
 (define-error 'relay-request-error "relay request failed")
@@ -94,10 +102,78 @@ the server's protocol limit by default."
   (dircache-mtime (make-hash-table :test 'equal)) ; localdir -> directory's own mtime at fetch time
   (cache-epoch 0)                           ; invalidates in-flight cache fills
   (watches (make-hash-table :test 'equal))  ; localdir -> list of (descriptor . callback)
+  (callback-queue nil)                      ; reverse-order queue of pending zero-arg thunks
+  (drain-scheduled nil)                     ; non-nil while a drain timer is pending
+  (ready nil)                               ; non-nil once hello has succeeded (both sync and async paths)
+  (connect-waiters nil)                     ; list of (on-ready . on-error) pairs awaiting readiness
   hello)
 
 (defvar relay--connections (make-hash-table :test 'equal)
   "AUTHORITY string -> `relay-conn'.")
+
+;;;; ---------------------------------------------------------------------------
+;;;; Deferred callback queue
+;;
+;; `relay--dispatch' parses and routes each frame inline in the process
+;; filter, but must not run application callbacks there -- a slow callback
+;; would otherwise stall ingestion of the rest of an already-received chunk
+;; (multiple frames can arrive in one chunk; see `relay--filter's loop).
+;; Success (`relay--request-async') and streaming (`relay--request-stream')
+;; callbacks are queued here instead and run from a `run-at-time 0' drain,
+;; preserving arrival order per connection.
+;;
+;; The drain must refuse to run while a synchronous `relay--request' is
+;; blocked on this same connection: that wait re-enters the event loop via
+;; `accept-process-output', which also runs timers, so an ungated drain would
+;; let arbitrary application code execute underneath a caller that reasonably
+;; assumes nothing else runs during its blocking call. The drain reschedules
+;; itself until the blocking request resolves.
+
+(defun relay--conn-has-blocked-waiter-p (conn)
+  "Non-nil if some synchronous `relay--request' is still blocked on CONN."
+  (let ((blocked nil))
+    (maphash (lambda (_id entry) (when (eq entry 'waiting) (setq blocked t)))
+             (relay-conn-pending conn))
+    blocked))
+
+(defconst relay--blocked-drain-retry-delay 0.05
+  "Retry delay for a drain that found a blocked synchronous request.
+
+A blocked `relay--request' can wait up to `relay-request-timeout' (or
+`relay-connect-timeout', or an explicit exec TIMEOUT-MS -- tens of seconds).
+The condition only changes once that request resolves, so retrying via
+`run-at-time 0' would busy-poll an O(pending-count) check as fast as Emacs
+can cycle 0-delay timers for the whole wait. This delay is otherwise
+invisible: once actually unblocked, the normal path still drains via
+`run-at-time 0'.")
+
+(defun relay--drain-callback-queue (conn)
+  "Run CONN's queued callbacks in arrival order, unless a synchronous request
+is still blocked on CONN, in which case reschedule instead of running any of
+them -- see this section's header comment."
+  (setf (relay-conn-drain-scheduled conn) nil)
+  (when (relay-conn-callback-queue conn)
+    (if (relay--conn-has-blocked-waiter-p conn)
+        (relay--maybe-schedule-drain conn relay--blocked-drain-retry-delay)
+      (let ((thunks (nreverse (relay-conn-callback-queue conn))))
+        (setf (relay-conn-callback-queue conn) nil)
+        (dolist (thunk thunks) (funcall thunk))))))
+
+(defun relay--maybe-schedule-drain (conn &optional delay)
+  "Schedule a drain of CONN's callback queue after DELAY (default 0)
+seconds, unless one is already pending."
+  (unless (relay-conn-drain-scheduled conn)
+    (setf (relay-conn-drain-scheduled conn) t)
+    (run-at-time (or delay 0) nil #'relay--drain-callback-queue conn)))
+
+(defun relay--enqueue-callback (conn thunk)
+  "Queue THUNK (a zero-arg function) to run outside the process filter."
+  (when (>= (length (relay-conn-callback-queue conn))
+            relay-callback-queue-max-length)
+    (delete-process (relay-conn-process conn))
+    (error "relay: callback queue overflow for %s" (relay-conn-authority conn)))
+  (push thunk (relay-conn-callback-queue conn))
+  (relay--maybe-schedule-drain conn))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Transport / framing
@@ -134,29 +210,38 @@ AUTHORITY looks like \"ssh+DEST\" or \"local\"."
     (process-send-string (relay-conn-process conn) (concat header payload))))
 
 (defun relay--filter (proc chunk)
-  "Process filter: accumulate CHUNK, deframe, and dispatch complete messages."
+  "Process filter: accumulate CHUNK, deframe, and dispatch complete messages.
+
+Tracks an OFFSET into the accumulator instead of re-slicing the unread
+suffix with `substring' after every individual frame -- a chunk can contain
+several frames (large history burst, several small watch events coalesced by
+the OS), and the previous approach copied the whole remaining accumulator
+once per frame rather than once per filter call."
   (let ((conn (process-get proc 'relay-conn)))
     (setf (relay-conn-acc conn) (concat (relay-conn-acc conn) chunk))
-    (let ((acc (relay-conn-acc conn))
-          (done nil))
-      (while (and (not done) (>= (length acc) 4))
-        (let ((len (logior (aref acc 0)
-                            (ash (aref acc 1) 8)
-                            (ash (aref acc 2) 16)
-                            (ash (aref acc 3) 24))))
+    (let* ((acc (relay-conn-acc conn))
+           (total (length acc))
+           (offset 0)
+           (done nil))
+      (while (and (not done) (>= (- total offset) 4))
+        (let ((len (logior (aref acc offset)
+                            (ash (aref acc (+ offset 1)) 8)
+                            (ash (aref acc (+ offset 2)) 16)
+                            (ash (aref acc (+ offset 3)) 24))))
           (cond
            ((not (relay--frame-size-allowed-p len))
             ;; The stream cannot safely be resynchronized after an invalid
             ;; announced length.  Drop it rather than retaining its payload.
-            (setq acc "" done t)
+            (setq offset total done t)
             (delete-process proc))
-           ((< (length acc) (+ 4 len))
+           ((< (- total offset) (+ 4 len))
             (setq done t))                ; wait for the rest of this frame
            (t
-            (let ((payload (substring acc 4 (+ 4 len))))
-              (setq acc (substring acc (+ 4 len)))
+            (let ((payload (substring acc (+ offset 4) (+ offset 4 len))))
+              (setq offset (+ offset 4 len))
               (relay--dispatch conn (decode-coding-string payload 'utf-8)))))))
-      (setf (relay-conn-acc conn) acc))))
+      (setf (relay-conn-acc conn)
+            (if (= offset 0) acc (substring acc offset))))))
 
 (defun relay--dispatch (conn json)
   "Parse one JSON message and route it (reply -> pending table, event -> cache).
@@ -167,7 +252,15 @@ The pending table holds one of three shapes per id: the symbol `waiting'
 multi-reply `relay--request-stream'). Only the last is new — the first two
 are exactly as before; a streaming reply just doesn't remove the id from the
 table until its final (no `:more') message arrives, so a request can now
-have any number of replies before completing instead of exactly one."
+have any number of replies before completing instead of exactly one.
+
+Routing and pending-table bookkeeping (matching an id, removing it once its
+final reply arrives, installing a synchronous reply) all happen inline here,
+still synchronous with the process filter -- only actually invoking an
+async/stream callback is deferred, via `relay--enqueue-callback' (see the
+\"Deferred callback queue\" section above). Event handling (`relay--handle-event',
+a distinct, cache-invalidation-only feature Muster doesn't use) is left
+inline; only reply and stream callbacks queue."
   (let ((msg (json-parse-string json :object-type 'plist :array-type 'list
                                 :null-object nil :false-object nil)))
     (let ((id (plist-get msg :id))
@@ -179,13 +272,14 @@ have any number of replies before completing instead of exactly one."
           (cond
            ((and (consp entry) (eq (car entry) 'stream))
             (if (plist-get msg :more)
-                (funcall (cadr entry) msg)
+                (relay--enqueue-callback conn (lambda () (funcall (cadr entry) msg)))
               (remhash id (relay-conn-pending conn))
-              (funcall (cddr entry) msg)))
+              (relay--enqueue-callback conn (lambda () (funcall (cddr entry) msg)))))
            ((functionp entry)
-            ;; Async request: fire its callback.
+            ;; Async request: remove it now (a late duplicate/reply for the
+            ;; same id must be a no-op), but defer firing its callback.
             (remhash id (relay-conn-pending conn))
-            (funcall entry msg))
+            (relay--enqueue-callback conn (lambda () (funcall entry msg))))
            ((eq entry 'waiting)
             ;; Sync request: install the reply, releasing the blocked waiter.
             (puthash id msg (relay-conn-pending conn)))
@@ -297,27 +391,70 @@ async events may run mid-wait — we only watch our own id."
                                 (or (plist-get resp :error) "unknown error"))
                         resp)))))))
 
-(defun relay--request-async (conn op args callback)
+(defun relay--request-async (conn op args callback &optional timeout)
   "Send OP with ARGS and call CALLBACK with the reply plist when it arrives.
 Returns immediately; never blocks Emacs. Used for background prefetch and any
 non-interactive-path work. Replies are id-matched, so out-of-order server
-replies are fine."
+replies are fine.
+
+TIMEOUT, if non-nil, is a number of seconds: if no reply arrives within it,
+CALLBACK is called once with a synthetic failure and the id is cancelled (see
+`relay--cancel-request'), so a real reply arriving later is silently
+dropped. Nil (the default) never times out -- this function's original,
+unbounded behavior, unchanged for every existing caller."
   (let ((id (cl-incf (relay-conn-next-id conn))))
     (puthash id callback (relay-conn-pending conn))
     (relay--send conn (append (list :id id :op op) args))
+    (when timeout
+      (run-at-time timeout nil #'relay--timeout-request conn id))
     id))
 
-(defun relay--request-stream (conn op args chunk-fn done-fn)
+(defun relay--request-stream (conn op args chunk-fn done-fn &optional timeout)
   "Like `relay--request-async', but OP may reply with any number of chunks
 before completing, not just one. CHUNK-FN is called with each intermediate
 reply (one carrying `:more'); DONE-FN is called once, with the final reply
 \(the one with no `:more'), after which the id is no longer pending. Never
 blocks. See `relay--dispatch' for how the pending-table shape distinguishes
-this from a plain single-reply async request."
+this from a plain single-reply async request.
+
+TIMEOUT is as in `relay--request-async': if non-nil and no reply (of either
+kind) arrives within it, DONE-FN is called once with a synthetic failure."
   (let ((id (cl-incf (relay-conn-next-id conn))))
     (puthash id (cons 'stream (cons chunk-fn done-fn)) (relay-conn-pending conn))
     (relay--send conn (append (list :id id :op op) args))
+    (when timeout
+      (run-at-time timeout nil #'relay--timeout-request conn id))
     id))
+
+(defun relay--cancel-request (conn id)
+  "Cancel pending request ID on CONN.
+
+A reply arriving afterward for ID is silently dropped, the same as any reply
+for an id no longer in CONN's pending table (see `relay--dispatch'), so this
+is idempotent: cancelling an unknown, already-completed, or
+already-cancelled id is a harmless no-op. Only meaningful for
+`relay--request-async'/`relay--request-stream' ids -- a synchronous
+`relay--request' blocks its only caller until it resolves, so nothing else
+could call this concurrently for its id.
+
+Does not explicitly cancel any timer registered by that request's TIMEOUT:
+`relay--timeout-request' already re-checks the pending table before acting,
+so a timer that fires after cancellation is itself a harmless no-op: not
+worth the bookkeeping of tracking and cancelling timer objects for a case
+that is already safe."
+  (remhash id (relay-conn-pending conn)))
+
+(defun relay--timeout-request (conn id)
+  "Synthesize a timeout failure for ID on CONN, if it is still pending.
+
+A no-op if ID already completed or was cancelled before this fired -- see
+`relay--cancel-request'."
+  (let ((entry (gethash id (relay-conn-pending conn))))
+    (when (or (functionp entry) (and (consp entry) (eq (car entry) 'stream)))
+      (remhash id (relay-conn-pending conn))
+      (let ((failure (list :ok nil :error "relay: request timed out" :timeout t))
+            (fn (if (functionp entry) entry (cddr entry))))
+        (relay--enqueue-callback conn (lambda () (funcall fn failure)))))))
 
 (defun relay--connection (authority)
   "Return a live connection for AUTHORITY, (re)connecting as needed."
@@ -362,7 +499,8 @@ this from a plain single-reply async request."
             (setf (relay-conn-hello conn)
                   (relay--request conn "hello" :version relay-protocol-version))
             (relay--require-protocol-version (relay-conn-hello conn))
-            (relay--require-revision-capability (relay-conn-hello conn)))
+            (relay--require-revision-capability (relay-conn-hello conn))
+            (setf (relay-conn-ready conn) t))
         (error
          (when (eq (gethash authority relay--connections) conn)
            (remhash authority relay--connections))
@@ -374,6 +512,119 @@ this from a plain single-reply async request."
       ;; silently leave them lazy until some future visit happened to occur.
       (relay--revalidate-marked-on-connect conn)
       conn)))
+
+;;;; ---------------------------------------------------------------------------
+;;;; Async connection establishment
+
+(defun relay-connect-async (authority on-ready on-error)
+  "Ensure a ready connection for AUTHORITY, calling ON-READY with it.
+
+Fans concurrent callers for the same not-yet-ready connection out to a
+single in-flight connect attempt rather than starting a redundant one.
+ON-READY/ON-ERROR are always called asynchronously (never from within this
+call), even when a ready connection already exists, so callers cannot
+observe two different calling conventions depending on connection state.
+Returns nil; this is a purely callback-based API, there is nothing
+meaningful to return synchronously (see README-LATENCY.md's guidance
+against local methods returning data synchronously)."
+  (let ((conn (gethash authority relay--connections)))
+    (cond
+     ((and conn (process-live-p (relay-conn-process conn)) (relay-conn-ready conn))
+      ;; Ready connection exists: call on-ready asynchronously with it.
+      (run-at-time 0 nil on-ready conn))
+     ((and conn (process-live-p (relay-conn-process conn)))
+      ;; Connection exists but not ready yet: queue this waiter to be called when ready.
+      (push (cons on-ready on-error) (relay-conn-connect-waiters conn)))
+     (t
+      ;; No connection: start a fresh async connect with this waiter.
+      (relay--connect-async-start authority (list (cons on-ready on-error)))))
+    nil))
+
+(defun relay--connect-async-start (authority waiters)
+  "Start an async connection for AUTHORITY, queuing WAITERS for notification.
+
+WAITERS is a list of (on-ready . on-error) pairs."
+  (let* ((default-directory temporary-file-directory)
+         (stderr (get-buffer-create (format " *relay-%s-stderr*" authority)))
+         proc conn)
+    (with-current-buffer stderr
+      (let ((inhibit-read-only t)) (erase-buffer)))
+    (condition-case err
+        (let ((cmd (relay--auth-command authority)))
+          (setq proc (make-process
+                      :name (format "relay-%s" authority)
+                      :command cmd
+                      :coding 'binary
+                      :connection-type 'pipe
+                      :noquery t
+                      :stderr stderr
+                      :filter #'relay--filter
+                      :sentinel #'relay--sentinel))
+          (setq conn (relay--make-conn :process proc :authority authority
+                                       :connect-waiters waiters))
+          (process-put proc 'relay-conn conn)
+          (process-put proc 'relay-stderr-buffer stderr)
+          (puthash authority conn relay--connections)
+          ;; Send hello asynchronously with a callback to handle the reply.
+          (relay--request-async conn "hello" (list :version relay-protocol-version)
+                                (lambda (reply)
+                                  (relay--connect-async-hello-done conn reply))
+                                relay-connect-timeout))
+      (error
+       ;; On any synchronous error (auth-command fail, make-process fail, send
+       ;; fail), undo any partial setup -- matching the synchronous
+       ;; `relay--connect's cleanup -- before notifying waiters, so a broken
+       ;; half-registered conn can never linger in `relay--connections'.
+       (when (and conn (eq (gethash authority relay--connections) conn))
+         (remhash authority relay--connections))
+       (when (and proc (process-live-p proc))
+         (delete-process proc))
+       (let ((failure (list :ok nil :error (error-message-string err))))
+         (dolist (waiter waiters)
+           (when (cdr waiter)
+             (run-at-time 0 nil (cdr waiter) failure))))))))
+
+(defun relay--connect-async-hello-done (conn reply)
+  "Handle the hello reply for an async connection attempt.
+
+Either completes the connection successfully and calls all waiters' on-ready
+callbacks, or calls all waiters' on-error callbacks if the hello failed."
+  (let ((waiters (nreverse (relay-conn-connect-waiters conn)))
+        (authority (relay-conn-authority conn)))
+    ;; Clear the waiters list now that we've captured it.
+    (setf (relay-conn-connect-waiters conn) nil)
+    ;; Check for failure: either the reply is not ok, or protocol checks fail.
+    (let ((hello-error nil))
+      (cond
+       ((not (plist-get reply :ok))
+        ;; Request failed (timeout, transport error, etc).
+        (setq hello-error reply))
+       (t
+        ;; Request succeeded; now check protocol and capabilities.
+        (condition-case err
+            (progn
+              (relay--require-protocol-version reply)
+              (relay--require-revision-capability reply))
+          (error
+           ;; Protocol check failed.
+           (setq hello-error (list :ok nil :error (error-message-string err)))))))
+      (if hello-error
+          ;; Failed: remove the connection and call each waiter's on-error.
+          (progn
+            (when (eq (gethash authority relay--connections) conn)
+              (remhash authority relay--connections))
+            (when (process-live-p (relay-conn-process conn))
+              (delete-process (relay-conn-process conn)))
+            (dolist (waiter waiters)
+              (when (cdr waiter)
+                (run-at-time 0 nil (cdr waiter) hello-error))))
+        ;; Success: set hello, mark ready, revalidate, and call each waiter's on-ready.
+        (setf (relay-conn-hello conn) reply)
+        (setf (relay-conn-ready conn) t)
+        (relay--revalidate-marked-on-connect conn)
+        (dolist (waiter waiters)
+          (when (car waiter)
+            (run-at-time 0 nil (car waiter) conn)))))))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Name parsing helpers

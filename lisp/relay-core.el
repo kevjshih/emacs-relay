@@ -620,93 +620,28 @@ Idempotent. Does not abort a chunk request already in flight; see
 `relay-tail-read-token''s docstring for why."
   (setf (relay-tail-read-token-cancelled token) t))
 
-(defun relay-tail-read--assemble (chunks start actual-end file-size dev ino
-                                          more-available truncated-or-rotated)
+(defun relay-tail-read--assemble (bytes start actual-end file-size dev ino
+                                         more-available outcome)
   "Build one `relay-tail-read-chunked-async' result plist.
 
-CHUNKS is every chunk's :bytes so far, in most-recent-first order (each
-consed on by `relay-tail-read--chunk-loop' as it arrives) -- reversed and
-concatenated here into the final byte sequence, in the same shape
-`relay-tail-read-async' itself returns."
-  (list :bytes (apply #'concat (nreverse chunks))
+BYTES is the already-assembled byte string (concatenated as chunks arrive,
+not deferred to a reverse-then-concat step at the end). OUTCOME is
+`complete' (reached EOF), `capped' (`relay-tail-read-max-total-bytes' was
+hit before EOF), or `rotated' (a rotation/truncation surfaced mid-sequence;
+BYTES describes only that reply's own re-anchored read, per
+`relay-tail-read-chunked-async''s docstring). :truncated-or-rotated and
+:more-available are still set too, matching `relay-tail-read-async''s own
+result shape for a caller that only checks those two fields -- :outcome
+exists for a caller that wants its state machine to branch on one field
+instead of inferring `capped' vs. `rotated' from a combination of both."
+  (list :bytes bytes
         :start start
         :actual-end actual-end
         :file-size file-size
         :dev dev :ino ino
-        :truncated-or-rotated truncated-or-rotated
-        :more-available more-available))
-
-(defun relay-tail-read--chunk-loop (authority path offset dev ino
-                                     chunks total-bytes first-start last-file-size
-                                     token on-success on-error)
-  "Issue one chunk request and continue, or finish, a
-`relay-tail-read-chunked-async' sequence. See that function's docstring for
-the overall contract; this is its recursive step, called once per chunk.
-
-FIRST-START is the sequence's true start offset, captured from the first
-chunk's own :start (which already reflects a chunk-1 re-anchor if one
-happened) rather than assumed to be the caller's original KNOWN-OFFSET.
-LAST-FILE-SIZE is the most recent chunk's own :file-size, carried forward
-so the total-bytes-cap branch below (which stops before issuing another
-request) has a real file-size to report instead of guessing one."
-  (if (relay-tail-read-token-cancelled token)
-      nil
-    (let ((remaining (- relay-tail-read-max-total-bytes total-bytes)))
-      (if (<= remaining 0)
-          ;; Hit the total-bytes cap before EOF: stop and deliver what's been
-          ;; assembled so far, :more-available t so a caller knows to
-          ;; continue with another call anchored at OFFSET.
-          (funcall on-success
-                   (relay-tail-read--assemble chunks (or first-start offset)
-                                              offset last-file-size dev ino t nil))
-        (relay-tail-read-async
-         authority path offset dev ino remaining
-         (lambda (result)
-           (unless (relay-tail-read-token-cancelled token)
-             (let* ((bytes (plist-get result :bytes))
-                    (new-chunks (cons bytes chunks))
-                    (new-total (+ total-bytes (length bytes)))
-                    (start (or first-start (plist-get result :start)))
-                    (actual-end (plist-get result :actual-end))
-                    (file-size (plist-get result :file-size))
-                    (new-dev (plist-get result :dev))
-                    (new-ino (plist-get result :ino))
-                    (more (plist-get result :more-available)))
-               (cond
-                ;; A rotation/truncation surfaced mid-sequence -- only
-                ;; possible from the second chunk onward, once DEV/INO from
-                ;; the first reply is known and passed forward as this
-                ;; request's known_dev/known_ino: the per-call snapshot
-                ;; guarantee `tail_read' provides does not extend across a
-                ;; whole chunk sequence, so every chunk re-checks identity,
-                ;; not just the first. The server re-anchors THIS reply at
-                ;; byte 0 of whatever file currently exists at PATH -- bytes
-                ;; from an earlier chunk in NEW-CHUNKS came from the old,
-                ;; now-rotated-away file, so they are discarded entirely
-                ;; here rather than concatenated with this reply's own bytes
-                ;; (that would silently splice two different files together,
-                ;; exactly the Frankenstein-buffer risk a per-chunk identity
-                ;; check exists to prevent). Deliver exactly this reply, as
-                ;; if it were the only chunk read; the sequence always stops
-                ;; here regardless of this reply's own :more-available, so a
-                ;; caller re-anchoring on :truncated-or-rotated and issuing
-                ;; a fresh read/chunked-read decides how to continue, the
-                ;; same as it already must for a single non-chunked call.
-                ((plist-get result :truncated-or-rotated)
-                 (funcall on-success
-                          (relay-tail-read--assemble
-                           (list bytes) (plist-get result :start) actual-end file-size
-                           new-dev new-ino more t)))
-                (more
-                 (relay-tail-read--chunk-loop
-                  authority path actual-end new-dev new-ino
-                  new-chunks new-total start file-size token on-success on-error))
-                (t
-                 (funcall on-success
-                          (relay-tail-read--assemble
-                           new-chunks start actual-end file-size
-                           new-dev new-ino nil nil)))))))
-         on-error)))))
+        :truncated-or-rotated (eq outcome 'rotated)
+        :more-available more-available
+        :outcome outcome))
 
 (defun relay-tail-read-chunked-async (authority path known-offset known-dev known-ino
                                                  on-success on-error)
@@ -731,21 +666,96 @@ re-anchor handling (discard buffered partial state) already covers this
 without needing to know it came from a chunk sequence.
 
 ON-SUCCESS is called at most once, with a plist shaped like
-`relay-tail-read-async''s own result. In the ordinary (non-rotated) case,
-:bytes is the concatenation of every chunk read so far, and :more-available
-is non-nil only if the total-bytes cap was hit before reaching EOF --
-exactly as with a single call's :more-available, a caller should issue
-another `relay-tail-read-chunked-async' anchored at the returned
-:actual-end to continue. In the rotated case, :bytes/:more-available
-describe only that last, re-anchored reply (see above). ON-ERROR is called
-at most once if any chunk request itself fails.
+`relay-tail-read-async''s own result plus an :outcome key (`complete',
+`capped', or `rotated' -- see `relay-tail-read--assemble'). In the ordinary
+(non-rotated) case, :bytes is the concatenation of every chunk read so
+far, and :more-available is non-nil only if the total-bytes cap was hit
+before reaching EOF -- exactly as with a single call's :more-available, a
+caller should issue another `relay-tail-read-chunked-async' anchored at
+the returned :actual-end to continue. In the rotated case, :bytes/
+:more-available describe only that last, re-anchored reply (see above).
+ON-ERROR is called at most once if any chunk request itself fails.
 
 Returns a `relay-tail-read-token' -- pass it to `relay-tail-read-cancel' to
 stop the sequence from issuing its next chunk (a request already in flight
 is allowed to complete and is simply discarded, not actively aborted)."
   (let ((token (relay-tail-read-token--create)))
-    (relay-tail-read--chunk-loop authority path known-offset known-dev known-ino
-                                 nil 0 nil nil token on-success on-error)
+    (cl-labels
+        ((step (offset dev ino bytes-so-far total-bytes first-start last-file-size)
+           "One chunk request, or the sequence's finish, given the loop state
+accumulated so far. AUTHORITY/PATH/TOKEN/ON-SUCCESS/ON-ERROR are closed
+over from the enclosing call rather than threaded through every recursive
+call -- they never change across the sequence. FIRST-START is the
+sequence's true start offset, captured from the first chunk's own :start
+\(which already reflects a chunk-1 re-anchor if one happened\) rather than
+assumed to be KNOWN-OFFSET. LAST-FILE-SIZE is the most recent chunk's own
+:file-size, carried forward so the total-bytes-cap branch below \(which
+stops before issuing another request\) has a real file-size to report
+instead of guessing one."
+           (if (relay-tail-read-token-cancelled token)
+               nil
+             (let ((remaining (- relay-tail-read-max-total-bytes total-bytes)))
+               (if (<= remaining 0)
+                   ;; Hit the total-bytes cap before EOF: stop and deliver
+                   ;; what's been assembled so far, more-available t so a
+                   ;; caller knows to continue with another call anchored
+                   ;; at OFFSET.
+                   (funcall on-success
+                            (relay-tail-read--assemble
+                             bytes-so-far (or first-start offset) offset
+                             last-file-size dev ino t 'capped))
+                 (relay-tail-read-async
+                  authority path offset dev ino remaining
+                  (lambda (result)
+                    (unless (relay-tail-read-token-cancelled token)
+                      (let* ((bytes (plist-get result :bytes))
+                             (new-total (+ total-bytes (length bytes)))
+                             (start (or first-start (plist-get result :start)))
+                             (actual-end (plist-get result :actual-end))
+                             (file-size (plist-get result :file-size))
+                             (new-dev (plist-get result :dev))
+                             (new-ino (plist-get result :ino))
+                             (more (plist-get result :more-available)))
+                        (cond
+                         ;; A rotation/truncation surfaced mid-sequence --
+                         ;; only possible from the second chunk onward, once
+                         ;; DEV/INO from the first reply is known and passed
+                         ;; forward as this request's known_dev/known_ino:
+                         ;; the per-call snapshot guarantee `tail_read'
+                         ;; provides does not extend across a whole chunk
+                         ;; sequence, so every chunk re-checks identity, not
+                         ;; just the first. The server re-anchors THIS reply
+                         ;; at byte 0 of whatever file currently exists at
+                         ;; PATH -- BYTES-SO-FAR came from the old,
+                         ;; now-rotated-away file, so it is discarded
+                         ;; entirely here rather than concatenated with this
+                         ;; reply's own bytes (that would silently splice
+                         ;; two different files together, exactly the
+                         ;; Frankenstein-buffer risk a per-chunk identity
+                         ;; check exists to prevent). Deliver exactly this
+                         ;; reply, as if it were the only chunk read; the
+                         ;; sequence always stops here regardless of this
+                         ;; reply's own :more-available, so a caller
+                         ;; re-anchoring on :truncated-or-rotated and
+                         ;; issuing a fresh read/chunked-read decides how to
+                         ;; continue, the same as it already must for a
+                         ;; single non-chunked call.
+                         ((plist-get result :truncated-or-rotated)
+                          (funcall on-success
+                                   (relay-tail-read--assemble
+                                    bytes (plist-get result :start) actual-end
+                                    file-size new-dev new-ino more 'rotated)))
+                         (more
+                          (step actual-end new-dev new-ino
+                                (concat bytes-so-far bytes) new-total
+                                start file-size))
+                         (t
+                          (funcall on-success
+                                   (relay-tail-read--assemble
+                                    (concat bytes-so-far bytes) start actual-end
+                                    file-size new-dev new-ino nil 'complete)))))))
+                  on-error))))))
+      (step known-offset known-dev known-ino "" 0 nil nil))
     token))
 
 (defun relay--connection (authority)

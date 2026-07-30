@@ -1438,6 +1438,7 @@ across more than one real chunk request, matching a full direct read."
           (should (= (plist-get result :file-size) (length content)))
           (should-not (plist-get result :truncated-or-rotated))
           (should-not (plist-get result :more-available))
+          (should (eq (plist-get result :outcome) 'complete))
           (should (integerp (plist-get result :dev)))
           (should (integerp (plist-get result :ino))))
       (dolist (c (relay-test--hash-values relay--connections))
@@ -1474,6 +1475,7 @@ appended -- proven by asserting the exact capped prefix, not just a count."
           (should result)
           (should (equal (plist-get result :bytes) "0123456789"))
           (should (= (plist-get result :actual-end) 10))
+          (should (eq (plist-get result :outcome) 'capped))
           (should (plist-get result :more-available)))
       (dolist (c (relay-test--hash-values relay--connections))
         (when (process-live-p (relay-conn-process c))
@@ -1562,6 +1564,7 @@ real file swap against real network chunk timing."
       ;; and new files together.
       (should (equal (plist-get result :bytes) "rotated-content"))
       (should (plist-get result :truncated-or-rotated))
+      (should (eq (plist-get result :outcome) 'rotated))
       (should (= (plist-get result :dev) 999))
       (should (= (plist-get result :ino) 888)))))
 

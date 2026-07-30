@@ -91,6 +91,92 @@ pub(crate) fn read_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>, R
     Err(RevisionError::UnstableRead)
 }
 
+/// One `tail_read` reply. See `tail_read`'s docstring for field semantics.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TailRead {
+    pub bytes: Vec<u8>,
+    pub start: u64,
+    pub actual_end: u64,
+    pub file_size: u64,
+    pub dev: u64,
+    pub ino: u64,
+    pub truncated_or_rotated: bool,
+    pub more_available: bool,
+}
+
+/// Largest single `tail_read` reply. Matches `read_range`'s bound for now;
+/// raising it (README-LATENCY.md notes Muster's chunking need can exceed
+/// this) is separate follow-up work, not required for this op to be correct.
+const MAX_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// Read an append-tolerant snapshot tail: bytes from KNOWN_OFFSET through
+/// EOF as observed by one stat, capped at MAX_BYTES.
+///
+/// Unlike `read_range`, this does not retry when the file changes during the
+/// read and does not compare metadata before/after: an append arriving after
+/// the snapshot is not an error (the next call picks it up), and requiring
+/// before/after equality is exactly the bug this op exists to avoid -- see
+/// README-LATENCY.md's "Range consistency on append" finding. The only
+/// re-anchor conditions are ones a plain retry cannot fix: identity change
+/// (KNOWN_DEV/KNOWN_INO, when the caller supplies them, no longer match --
+/// rotation) or KNOWN_OFFSET no longer being a valid prefix of the current
+/// file (it shrank -- truncation). Either sets `truncated_or_rotated` and
+/// re-anchors the read at offset 0 rather than erroring, so callers get
+/// real bytes back and a clear signal to discard buffered partial state,
+/// instead of having to retry themselves after an error.
+///
+/// `actual_end` always describes the bytes actually returned (`start +
+/// bytes.len()`), never the requested end -- a concurrent truncation mid-read
+/// can make the real read shorter than MAX_BYTES even without triggering the
+/// pre-read `truncated_or_rotated` check (which only inspects the pre-read
+/// stat); the caller's own next call re-stats fresh and self-corrects.
+pub(crate) fn tail_read(
+    path: &Path,
+    known_offset: u64,
+    known_dev: Option<u64>,
+    known_ino: Option<u64>,
+    max_bytes: u64,
+) -> Result<TailRead, RevisionError> {
+    let max_bytes = max_bytes.min(MAX_TAIL_BYTES);
+    let mut file = open_checked(path)?;
+    let metadata = file.metadata().map_err(|error| io_error("tail_read", error))?;
+    if let Some(kind) = final_type(&metadata) {
+        return Err(RevisionError::UnsupportedFinalType(kind));
+    }
+    let file_size = metadata.size();
+    let dev = metadata.dev();
+    let ino = metadata.ino();
+
+    let identity_changed =
+        known_dev.is_some_and(|d| d != dev) || known_ino.is_some_and(|i| i != ino);
+    let shrunk = known_offset > file_size;
+    let truncated_or_rotated = identity_changed || shrunk;
+    let start = if truncated_or_rotated { 0 } else { known_offset };
+    let want_end = start.saturating_add(max_bytes).min(file_size);
+
+    let mut bytes = Vec::new();
+    if start < want_end {
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| io_error("tail_read", error))?;
+        bytes.reserve((want_end - start) as usize);
+        file.by_ref()
+            .take(want_end - start)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error("tail_read", error))?;
+    }
+    let actual_end = start + bytes.len() as u64;
+    Ok(TailRead {
+        bytes,
+        start,
+        actual_end,
+        file_size,
+        dev,
+        ino,
+        truncated_or_rotated,
+        more_available: actual_end < file_size,
+    })
+}
+
 /// Test seam for deterministically changing a file between descriptor metadata
 /// samples.  It will become private to the test module once real read logic is
 /// in place.

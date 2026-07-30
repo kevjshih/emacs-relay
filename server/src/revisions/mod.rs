@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 pub(crate) use types::{
     Revision, ExpectedRevision, ConditionalWrite, RevisionError,
 };
-pub(crate) use read::{read_range, read_with_revision};
+pub(crate) use read::{read_range, read_with_revision, tail_read};
 
 const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 const READ_ATTEMPTS: usize = 3;

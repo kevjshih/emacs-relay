@@ -89,6 +89,28 @@ pub(crate) fn handle_fs(req: &Value, tx: &SyncSender<Vec<u8>>, registry: &ExecRe
         framing::finish(tx, id, result);
         return;
     }
+    if op == "tail_read" {
+        let known_offset = req.get("known_offset").and_then(Value::as_u64).unwrap_or(0);
+        let known_dev = req.get("known_dev").and_then(Value::as_u64);
+        let known_ino = req.get("known_ino").and_then(Value::as_u64);
+        let max_bytes = req.get("max_bytes").and_then(Value::as_u64).unwrap_or(0);
+        let result = revisions::tail_read(Path::new(&path), known_offset, known_dev, known_ino, max_bytes)
+            .map(|tail| {
+                json!({
+                    "bytes_b64": B64.encode(tail.bytes),
+                    "start": tail.start,
+                    "actual_end": tail.actual_end,
+                    "file_size": tail.file_size,
+                    "dev": tail.dev,
+                    "ino": tail.ino,
+                    "truncated_or_rotated": tail.truncated_or_rotated,
+                    "more_available": tail.more_available,
+                })
+            })
+            .map_err(|error| error.readable());
+        framing::finish(tx, id, result);
+        return;
+    }
     if op == "write" {
         let append = req.get("append").and_then(Value::as_bool).unwrap_or(false);
         let must_be_new = req

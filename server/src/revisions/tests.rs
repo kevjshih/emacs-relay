@@ -488,3 +488,119 @@ fn structured_wire_conflicts_include_code_object_and_message() {
         Some("type_changed")
     );
 }
+
+#[test]
+fn tail_read_returns_bytes_from_known_offset_through_snapshot_eof() {
+    let dir = TempDir::new("tail-basic");
+    let path = dir.file("t.jsonl");
+    write(&path, b"0123456789");
+    let tail = tail_read(&path, 3, None, None, 1024).unwrap();
+    assert_eq!(tail.bytes, b"3456789");
+    assert_eq!(tail.start, 3);
+    assert_eq!(tail.actual_end, 10);
+    assert_eq!(tail.file_size, 10);
+    assert!(!tail.truncated_or_rotated);
+    assert!(!tail.more_available);
+}
+
+#[test]
+fn tail_read_tolerates_append_after_snapshot_without_erroring() {
+    // This is the behavior `read_range`'s before/after metadata-equality
+    // check would reject: an append that happens after this call's own
+    // snapshot must not be treated as an error. The first call's result
+    // reflects only what existed at ITS snapshot; the appended bytes are
+    // picked up cleanly by a second call anchored at the first call's
+    // actual_end, never lost and never causing either call to fail.
+    let dir = TempDir::new("tail-append");
+    let path = dir.file("t.jsonl");
+    write(&path, b"first-line\n");
+    let first = tail_read(&path, 0, None, None, 1024).unwrap();
+    assert_eq!(first.bytes, b"first-line\n");
+    assert_eq!(first.file_size, 11);
+    assert!(!first.more_available);
+
+    // Append after the first call's snapshot.
+    use std::io::Write;
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"second-line\n").unwrap();
+    drop(file);
+
+    let second = tail_read(
+        &path,
+        first.actual_end,
+        Some(first.dev),
+        Some(first.ino),
+        1024,
+    )
+    .unwrap();
+    assert_eq!(second.bytes, b"second-line\n");
+    assert_eq!(second.start, first.actual_end);
+    assert_eq!(second.file_size, 23);
+    assert!(!second.truncated_or_rotated);
+    assert!(!second.more_available);
+}
+
+#[test]
+fn tail_read_flags_truncation_when_known_offset_exceeds_file_size() {
+    let dir = TempDir::new("tail-truncate");
+    let path = dir.file("t.jsonl");
+    write(&path, b"short");
+    // KNOWN_OFFSET (100) is no longer a valid prefix of a 5-byte file.
+    let tail = tail_read(&path, 100, None, None, 1024).unwrap();
+    assert!(tail.truncated_or_rotated);
+    assert_eq!(tail.start, 0, "re-anchors at 0 rather than erroring");
+    assert_eq!(tail.bytes, b"short");
+}
+
+#[test]
+fn tail_read_flags_rotation_when_identity_changes() {
+    let dir = TempDir::new("tail-rotate");
+    let path = dir.file("t.jsonl");
+    write(&path, b"old-content");
+    let first = tail_read(&path, 0, None, None, 1024).unwrap();
+
+    // Simulate log rotation: remove and recreate under the same name, which
+    // gets a new inode.
+    fs::remove_file(&path).unwrap();
+    write(&path, b"new-content-after-rotation");
+
+    let second = tail_read(
+        &path,
+        first.actual_end,
+        Some(first.dev),
+        Some(first.ino),
+        1024,
+    )
+    .unwrap();
+    assert!(second.truncated_or_rotated);
+    assert_eq!(second.start, 0, "re-anchors at 0, not the stale offset");
+    assert_eq!(second.bytes, b"new-content-after-rotation");
+    assert_ne!(
+        (second.dev, second.ino),
+        (first.dev, first.ino),
+        "test premise: rotation must actually produce a new identity"
+    );
+}
+
+#[test]
+fn tail_read_caps_at_max_bytes_and_reports_more_available() {
+    let dir = TempDir::new("tail-cap");
+    let path = dir.file("t.jsonl");
+    write(&path, b"0123456789");
+    let first = tail_read(&path, 0, None, None, 4).unwrap();
+    assert_eq!(first.bytes, b"0123");
+    assert_eq!(first.actual_end, 4);
+    assert_eq!(first.file_size, 10);
+    assert!(
+        first.more_available,
+        "actual_end must describe bytes actually returned, capped below file_size"
+    );
+
+    let second = tail_read(&path, first.actual_end, Some(first.dev), Some(first.ino), 4).unwrap();
+    assert_eq!(second.bytes, b"4567");
+    assert!(second.more_available);
+
+    let third = tail_read(&path, second.actual_end, Some(first.dev), Some(first.ino), 4).unwrap();
+    assert_eq!(third.bytes, b"89");
+    assert!(!third.more_available, "exhausted at file_size, not at max_bytes");
+}

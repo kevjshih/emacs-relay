@@ -456,6 +456,72 @@ A no-op if ID already completed or was cancelled before this fired -- see
             (fn (if (functionp entry) entry (cddr entry))))
         (relay--enqueue-callback conn (lambda () (funcall fn failure)))))))
 
+;;;; ---------------------------------------------------------------------------
+;;;; Async file read primitives
+
+(defun relay-tail-read-async (authority path known-offset known-dev known-ino max-bytes on-success on-error)
+  "Read an append-tolerant tail snapshot of PATH on AUTHORITY's server.
+
+Never blocks. Requires the server to advertise `tail-read-v1'; ON-ERROR is
+called if it does not.
+
+KNOWN-OFFSET is the byte offset already read (0 for a fresh open).
+KNOWN-DEV/KNOWN-INO, if non-nil, are the device/inode this client already
+associates with PATH. When the server's current file no longer matches them,
+or KNOWN-OFFSET is no longer a valid prefix of the current file's size, the
+server re-anchors the read at byte 0 and reports a plist with :truncated-or-
+rotated t rather than signaling an error -- callers MUST check that field
+and discard any buffered partial state (e.g. an incomplete trailing JSONL
+record retained from a previous read) when it is non-nil; the returned bytes
+in that case do not continue KNOWN-OFFSET, they start fresh at file offset
+0. MAX-BYTES bounds this single reply; check :more-available in the result
+to know whether more remains beyond what this call returned.
+
+ON-SUCCESS is called with a plist:
+  (:bytes BYTES :start N :actual-end N :file-size N :dev N :ino N
+   :truncated-or-rotated BOOL :more-available BOOL)
+BYTES is a unibyte string containing the exact bytes returned (already
+base64-decoded). ON-ERROR is called with a failure plist for a missing
+capability, a connection failure, or the request itself failing.
+
+Returns nil; this is a purely callback-based API."
+  (relay-connect-async
+   authority
+   (lambda (conn)
+     ;; Connection is ready; check the tail-read-v1 capability.
+     (let ((hello (relay-conn-hello conn)))
+       (if (member "tail-read-v1" (plist-get hello :capabilities))
+           ;; Has tail-read-v1: build args and send the tail_read request.
+           (let* ((args (append (list :path path :known_offset known-offset :max_bytes max-bytes)
+                                (when known-dev (list :known_dev known-dev))
+                                (when known-ino (list :known_ino known-ino)))))
+             ;; Send the tail_read request and handle the reply.
+             (relay--request-async
+              conn "tail_read" args
+              (lambda (reply)
+                (if (plist-get reply :ok)
+                    ;; Success: build the result plist and call on-success.
+                    (funcall on-success
+                             (list :bytes (base64-decode-string (or (plist-get reply :bytes_b64) ""))
+                                   :start (plist-get reply :start)
+                                   :actual-end (plist-get reply :actual_end)
+                                   :file-size (plist-get reply :file_size)
+                                   :dev (plist-get reply :dev)
+                                   :ino (plist-get reply :ino)
+                                   :truncated-or-rotated (plist-get reply :truncated_or_rotated)
+                                   :more-available (plist-get reply :more_available)))
+                  ;; Request failed: call on-error.
+                  (funcall on-error (list :ok nil :error (plist-get reply :error)))))))
+         ;; Missing tail-read-v1 capability: call on-error asynchronously.
+         (run-at-time 0 nil on-error
+                      (list :ok nil
+                            :error (format "relay-tail-read-async: server for %s does not support tail-read (capabilities: %S) -- rebuild/reinstall relay-server via scripts/install-server.sh"
+                                           authority (plist-get hello :capabilities)))))))
+   ;; If relay-connect-async's on-error fires (connection failed), call our on-error.
+   (lambda (failure)
+     (funcall on-error failure)))
+  nil)
+
 (defun relay--connection (authority)
   "Return a live connection for AUTHORITY, (re)connecting as needed."
   (let ((conn (gethash authority relay--connections)))

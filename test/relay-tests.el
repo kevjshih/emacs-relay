@@ -1063,4 +1063,281 @@ on-error is called asynchronously with a transport error."
         (when (process-live-p (relay-conn-process c))
           (delete-process (relay-conn-process c)))))))
 
+;;;; ---------------------------------------------------------------------------
+;;;; Async tail-read primitives
+
+(ert-deftest relay-tail-read-async-basic-read ()
+  "A basic tail-read must return bytes, offsets, file size, dev/ino, and truncation status."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (tmpfile (make-temp-file "relay-tail-read-basic-"))
+         (content "Hello, World!")
+         (result nil)
+         (error-result nil)
+         (done nil)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          (write-region content nil tmpfile)
+          (relay-tail-read-async "local" tmpfile 0 nil nil 1024
+                                 (lambda (r) (setq result r done t))
+                                 (lambda (e) (setq error-result e done t)))
+          ;; Wait for the callback to fire.
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should-not error-result)
+          (should result)
+          ;; Check the returned bytes
+          (should (equal (plist-get result :bytes) content))
+          ;; Check offsets
+          (should (= (plist-get result :start) 0))
+          (should (= (plist-get result :actual-end) (length content)))
+          ;; Check file size
+          (should (= (plist-get result :file-size) (length content)))
+          ;; Check truncation status (should not be truncated on fresh read)
+          (should-not (plist-get result :truncated-or-rotated))
+          ;; Check more-available (shouldn't have more since we read everything)
+          (should-not (plist-get result :more-available))
+          ;; Check dev/ino are present (actual values don't matter)
+          (should (integerp (plist-get result :dev)))
+          (should (integerp (plist-get result :ino))))
+      ;; Cleanup
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-exists-p tmpfile)
+        (delete-file tmpfile)))))
+
+(ert-deftest relay-tail-read-async-append-tolerance ()
+  "A tail-read with known-dev/known-ino must tolerate appends and continue from known-offset."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (tmpfile (make-temp-file "relay-tail-read-append-"))
+         (content1 "First ")
+         (content2 "Second ")
+         (first-result nil)
+         (second-result nil)
+         (error-result nil)
+         (done-count 0)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          ;; First read: get initial content
+          (write-region content1 nil tmpfile)
+          (relay-tail-read-async "local" tmpfile 0 nil nil 1024
+                                 (lambda (r)
+                                   (setq first-result r)
+                                   (cl-incf done-count))
+                                 (lambda (e) (setq error-result e)))
+          ;; Wait for first callback
+          (while (and (= done-count 0) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should first-result)
+          (should-not error-result)
+          (should (equal (plist-get first-result :bytes) content1))
+
+          ;; Append more content to the file (write directly, not through relay)
+          (write-region content2 nil tmpfile t)
+
+          ;; Second read: use known-offset/dev/ino from first read
+          (relay-tail-read-async "local" tmpfile
+                                 (plist-get first-result :actual-end)
+                                 (plist-get first-result :dev)
+                                 (plist-get first-result :ino)
+                                 1024
+                                 (lambda (r)
+                                   (setq second-result r)
+                                   (cl-incf done-count))
+                                 (lambda (e) (setq error-result e)))
+          ;; Wait for second callback
+          (while (and (< done-count 2) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should second-result)
+          (should-not error-result)
+          ;; Should get the appended content, not truncated
+          (should (equal (plist-get second-result :bytes) content2))
+          (should-not (plist-get second-result :truncated-or-rotated)))
+      ;; Cleanup
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-exists-p tmpfile)
+        (delete-file tmpfile)))))
+
+(ert-deftest relay-tail-read-async-truncation-detection ()
+  "A file rotation/truncation must set truncated-or-rotated and re-anchor at 0."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (tmpfile (make-temp-file "relay-tail-read-truncate-"))
+         (content1 "Long original content ")
+         (content2 "Short")
+         (first-result nil)
+         (second-result nil)
+         (error-result nil)
+         (done-count 0)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          ;; First read: get initial content
+          (write-region content1 nil tmpfile)
+          (relay-tail-read-async "local" tmpfile 0 nil nil 1024
+                                 (lambda (r)
+                                   (setq first-result r)
+                                   (cl-incf done-count))
+                                 (lambda (e) (setq error-result e)))
+          ;; Wait for first callback
+          (while (and (= done-count 0) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should first-result)
+          (should-not error-result)
+
+          ;; Delete and recreate the file with different content
+          (delete-file tmpfile)
+          (write-region content2 nil tmpfile)
+
+          ;; Second read: use known-offset/dev/ino from first read
+          ;; Since the file was deleted/recreated, dev/ino will change
+          (relay-tail-read-async "local" tmpfile
+                                 (plist-get first-result :actual-end)
+                                 (plist-get first-result :dev)
+                                 (plist-get first-result :ino)
+                                 1024
+                                 (lambda (r)
+                                   (setq second-result r)
+                                   (cl-incf done-count))
+                                 (lambda (e) (setq error-result e)))
+          ;; Wait for second callback
+          (while (and (< done-count 2) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should second-result)
+          (should-not error-result)
+          ;; Should report truncated-or-rotated and start from 0
+          (should (plist-get second-result :truncated-or-rotated))
+          (should (= (plist-get second-result :start) 0))
+          ;; Should return the new file's content
+          (should (equal (plist-get second-result :bytes) content2)))
+      ;; Cleanup
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-exists-p tmpfile)
+        (delete-file tmpfile)))))
+
+(ert-deftest relay-tail-read-async-max-bytes-capping ()
+  "A read with small max-bytes must cap the result and set more-available."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (tmpfile (make-temp-file "relay-tail-read-maxbytes-"))
+         (content "0123456789abcdefghijklmnopqrstuvwxyz")
+         (first-result nil)
+         (second-result nil)
+         (error-result nil)
+         (done-count 0)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          ;; Write a file larger than our max-bytes
+          (write-region content nil tmpfile)
+
+          ;; First read: request only 10 bytes
+          (relay-tail-read-async "local" tmpfile 0 nil nil 10
+                                 (lambda (r)
+                                   (setq first-result r)
+                                   (cl-incf done-count))
+                                 (lambda (e) (setq error-result e)))
+          ;; Wait for first callback
+          (while (and (= done-count 0) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should first-result)
+          (should-not error-result)
+          ;; Should have exactly 10 bytes
+          (should (= (length (plist-get first-result :bytes)) 10))
+          (should (equal (plist-get first-result :bytes) "0123456789"))
+          (should (= (plist-get first-result :actual-end) 10))
+          ;; More should be available since file is 37 bytes
+          (should (plist-get first-result :more-available))
+
+          ;; Second read: continue from first actual-end
+          (relay-tail-read-async "local" tmpfile
+                                 (plist-get first-result :actual-end)
+                                 (plist-get first-result :dev)
+                                 (plist-get first-result :ino)
+                                 10
+                                 (lambda (r)
+                                   (setq second-result r)
+                                   (cl-incf done-count))
+                                 (lambda (e) (setq error-result e)))
+          ;; Wait for second callback
+          (while (and (< done-count 2) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should second-result)
+          (should-not error-result)
+          ;; Should have next 10 bytes
+          (should (= (length (plist-get second-result :bytes)) 10))
+          (should (equal (plist-get second-result :bytes) "abcdefghij"))
+          ;; Still more available
+          (should (plist-get second-result :more-available)))
+      ;; Cleanup
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-exists-p tmpfile)
+        (delete-file tmpfile)))))
+
+(ert-deftest relay-tail-read-async-missing-capability ()
+  "A missing tail-read-v1 capability must call on-error with a clear message."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (tmpfile (make-temp-file "relay-tail-read-nocap-"))
+         (result nil)
+         (error-result nil)
+         (done nil)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          (write-region "test content" nil tmpfile)
+          ;; Get a real connection first to verify it supports tail-read-v1
+          (let ((conn (relay--connection "local")))
+            ;; Stub relay-connect-async to provide a connection without tail-read-v1
+            (cl-letf (((symbol-function 'relay-connect-async)
+                       (lambda (authority on-ready on-error)
+                         ;; Create a fake connection with no tail-read capability
+                         (let* ((capabilities (plist-get (relay-conn-hello conn) :capabilities))
+                                ;; Remove tail-read-v1 from the capability list
+                                (modified-hello (list :protocol_version 1
+                                                      :capabilities (remove "tail-read-v1" capabilities))))
+                           ;; Call on-ready with a test connection that has the modified hello
+                           (let ((fake-conn (relay-test--conn "local")))
+                             (setf (relay-conn-hello fake-conn) modified-hello)
+                             (funcall on-ready fake-conn))))))
+              (relay-tail-read-async "local" tmpfile 0 nil nil 1024
+                                     (lambda (r) (setq result r done t))
+                                     (lambda (e) (setq error-result e done t))))
+            ;; Wait for the callback to fire
+            (while (and (not done) (< (float-time) deadline))
+              (sleep-for 0.02))
+            ;; Clean up the real connection
+            (when (process-live-p (relay-conn-process conn))
+              (delete-process (relay-conn-process conn))))
+
+          ;; Should not have called on-success
+          (should-not result)
+          ;; Should have called on-error
+          (should error-result)
+          ;; Error should mention the missing capability
+          (should (plist-get error-result :error))
+          (should (string-match-p "tail-read" (plist-get error-result :error))))
+      ;; Cleanup
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-exists-p tmpfile)
+        (delete-file tmpfile)))))
+
 ;;; relay-tests.el ends here

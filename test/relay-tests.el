@@ -1402,4 +1402,167 @@ on-error is called asynchronously with a transport error."
       (when (file-exists-p tmpfile)
         (delete-file tmpfile)))))
 
+;;;; ---------------------------------------------------------------------------
+;;;; relay-tail-read-chunked-async
+
+(ert-deftest relay-tail-read-chunked-async-multi-chunk-real-file ()
+  "A file larger than the server's per-request cap (1 MiB) must be assembled
+across more than one real chunk request, matching a full direct read."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (tmpfile (make-temp-file "relay-tail-read-chunked-multi-"))
+         ;; Larger than the server's 1 MiB per-request cap so the client must
+         ;; issue at least two real chunk requests to reach EOF.
+         (content (make-string (+ (* 1024 1024) 500) ?x))
+         (result nil)
+         (error-result nil)
+         (done nil)
+         (deadline (+ (float-time) 8.0)))
+    (unwind-protect
+        (progn
+          (write-region content nil tmpfile)
+          (relay-tail-read-chunked-async
+           "local" tmpfile 0 nil nil
+           (lambda (r) (setq result r done t))
+           (lambda (e) (setq error-result e done t)))
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should-not error-result)
+          (should result)
+          (should (= (length (plist-get result :bytes)) (length content)))
+          (should (equal (plist-get result :bytes) content))
+          (should (= (plist-get result :start) 0))
+          (should (= (plist-get result :actual-end) (length content)))
+          (should (= (plist-get result :file-size) (length content)))
+          (should-not (plist-get result :truncated-or-rotated))
+          (should-not (plist-get result :more-available))
+          (should (integerp (plist-get result :dev)))
+          (should (integerp (plist-get result :ino))))
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-exists-p tmpfile)
+        (delete-file tmpfile)))))
+
+(ert-deftest relay-tail-read-chunked-async-total-bytes-cap ()
+  "relay-tail-read-max-total-bytes must stop the sequence before EOF and
+report more-available, without a second chunk request's bytes ever being
+appended -- proven by asserting the exact capped prefix, not just a count."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (relay-tail-read-max-total-bytes 10)
+         (tmpfile (make-temp-file "relay-tail-read-chunked-cap-"))
+         (content "0123456789abcdefghij")
+         (result nil)
+         (error-result nil)
+         (done nil)
+         (deadline (+ (float-time) 3.0)))
+    (unwind-protect
+        (progn
+          (write-region content nil tmpfile)
+          (relay-tail-read-chunked-async
+           "local" tmpfile 0 nil nil
+           (lambda (r) (setq result r done t))
+           (lambda (e) (setq error-result e done t)))
+          (while (and (not done) (< (float-time) deadline))
+            (sleep-for 0.02))
+          (should done)
+          (should-not error-result)
+          (should result)
+          (should (equal (plist-get result :bytes) "0123456789"))
+          (should (= (plist-get result :actual-end) 10))
+          (should (plist-get result :more-available)))
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-exists-p tmpfile)
+        (delete-file tmpfile)))))
+
+(ert-deftest relay-tail-read-chunked-async-cancel-suppresses-delivery ()
+  "Cancelling the returned token must suppress both on-success and on-error,
+even for a reply already in flight when cancellation happens."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (tmpfile (make-temp-file "relay-tail-read-chunked-cancel-"))
+         (result nil)
+         (error-result nil)
+         (token nil))
+    (unwind-protect
+        (progn
+          (write-region "content" nil tmpfile)
+          (setq token
+                (relay-tail-read-chunked-async
+                 "local" tmpfile 0 nil nil
+                 (lambda (r) (setq result r))
+                 (lambda (e) (setq error-result e))))
+          (relay-tail-read-cancel token)
+          ;; Give any in-flight reply time to arrive and be discarded.
+          (let ((deadline (+ (float-time) 1.0)))
+            (while (< (float-time) deadline)
+              (sleep-for 0.02)))
+          (should-not result)
+          (should-not error-result)
+          ;; Cancelling twice must remain harmless.
+          (relay-tail-read-cancel token))
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-exists-p tmpfile)
+        (delete-file tmpfile)))))
+
+(ert-deftest relay-tail-read-chunked-async-stops-on-mid-sequence-rotation ()
+  "A rotation/truncation surfaced on a later chunk (not the first) must stop
+the sequence immediately, discard every earlier chunk's bytes (they came
+from a now-rotated-away file), and deliver exactly the rotated reply's own
+bytes -- never a concatenation spanning both files. Uses a stubbed
+relay-tail-read-async so the rotation is deterministic instead of racing a
+real file swap against real network chunk timing."
+  (let* ((calls 0)
+         (result nil)
+         (error-result nil)
+         (done nil))
+    (cl-letf (((symbol-function 'relay-tail-read-async)
+               (lambda (_authority _path _offset _dev _ino _max-bytes on-success _on-error)
+                 (cl-incf calls)
+                 (run-at-time
+                  0 nil
+                  (lambda ()
+                    (if (= calls 1)
+                        ;; First chunk: normal read, more available, identity 100/200.
+                        (funcall on-success
+                                 (list :bytes "first-chunk-" :start 0 :actual-end 12
+                                       :file-size 999 :dev 100 :ino 200
+                                       :truncated-or-rotated nil :more-available t))
+                      ;; Second chunk: the identity forwarded from chunk 1
+                      ;; (100/200) no longer matches on the server -- a
+                      ;; rotation between chunk 1 and chunk 2, not before
+                      ;; chunk 1. The server re-anchors at byte 0 of the new
+                      ;; file and returns that new file's own bytes.
+                      (funcall on-success
+                               (list :bytes "rotated-content" :start 0 :actual-end 15
+                                     :file-size 15 :dev 999 :ino 888
+                                     :truncated-or-rotated t :more-available nil))))))))
+      (relay-tail-read-chunked-async
+       "local" "/fake/path" 0 nil nil
+       (lambda (r) (setq result r done t))
+       (lambda (e) (setq error-result e done t)))
+      (let ((deadline (+ (float-time) 2.0)))
+        (while (and (not done) (< (float-time) deadline))
+          (sleep-for 0.02)))
+      (should done)
+      (should-not error-result)
+      (should result)
+      (should (= calls 2))
+      ;; Must reflect only the rotated chunk's own bytes -- not
+      ;; "first-chunk-rotated-content", which would silently splice the old
+      ;; and new files together.
+      (should (equal (plist-get result :bytes) "rotated-content"))
+      (should (plist-get result :truncated-or-rotated))
+      (should (= (plist-get result :dev) 999))
+      (should (= (plist-get result :ino) 888)))))
+
 ;;; relay-tests.el ends here

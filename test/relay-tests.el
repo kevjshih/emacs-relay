@@ -15,8 +15,7 @@
    :authority (or authority "local")
    :pending (make-hash-table)
    :dircache (make-hash-table :test 'equal)
-   :dircache-mtime (make-hash-table :test 'equal)
-   :watches (make-hash-table :test 'equal)))
+   :dircache-mtime (make-hash-table :test 'equal)))
 
 (defun relay-test--hash-values (table)
   (let (values)
@@ -250,13 +249,12 @@
 
 (ert-deftest relay-self-change-notifies-direct-file-watch ()
   "A direct file watch must receive the server's self_changed notification."
-  (let* ((conn (relay-test--conn))
+  (let* ((relay--direct-watches (make-hash-table :test 'equal))
+         (conn (relay-test--conn))
          (path "/root/file.txt")
-         (descriptor (cons conn 17))
-         received)
-    (puthash path
-             (list (cons descriptor (lambda (event) (setq received event))))
-             (relay-conn-watches conn))
+         received
+         (descriptor (relay--direct-watch-add
+                      "local" path (lambda (event) (setq received event)))))
     (cl-letf (((symbol-function 'run-at-time)
                (lambda (_delay _repeat function &rest args) (apply function args))))
       (relay--handle-event conn (list :event "self_changed" :dir path)))
@@ -267,14 +265,15 @@
 
 (ert-deftest relay-file-notify-rejects-a-failed-server-watch ()
   "Never return a valid-looking descriptor when the OS watch was rejected."
-  (let ((conn (relay-test--conn)))
+  (let ((relay--direct-watches (make-hash-table :test 'equal))
+        (conn (relay-test--conn)))
     (cl-letf (((symbol-function 'relay--connection) (lambda (_) conn))
               ((symbol-function 'relay--request)
                (lambda (&rest _) (error "watch resources exhausted"))))
       (should-error
        (relay--h-file-notify-add-watch
         "/relay:local:/root/file.txt" '(change) #'ignore))
-      (should (= (hash-table-count (relay-conn-watches conn)) 0)))))
+      (should (= (hash-table-count relay--direct-watches) 0)))))
 
 (ert-deftest relay-visited-modtime-preserves-nanoseconds ()
   "Two edits in the same second must not compare as an unchanged file."
@@ -910,16 +909,79 @@ bounded work queue, and writer backpressure without creating remote load."
 
 (ert-deftest relay-remove-watch-is-asynchronous ()
   "Unwatch cleanup must not make buffer/watch teardown wait for the network."
-  (let* ((conn (relay-test--conn))
-         (descriptor (cons conn 9))
+  (let* ((relay--direct-watches (make-hash-table :test 'equal))
+         (relay--connections (make-hash-table :test 'equal))
+         (conn (relay-test--conn))
+         (descriptor (relay--direct-watch-add "local" "/root" #'ignore))
          async-ops)
-    (puthash "/root" (list (cons descriptor #'ignore)) (relay-conn-watches conn))
+    (puthash "local" conn relay--connections)
     (cl-letf (((symbol-function 'relay--request)
                (lambda (&rest _) (error "synchronous unwatch")))
               ((symbol-function 'relay--request-async)
-               (lambda (_conn op _args _callback) (push op async-ops))))
+               (lambda (_conn op _args _callback) (push op async-ops)))
+              ((symbol-function 'process-live-p) (lambda (&rest _) t)))
       (relay--h-file-notify-rm-watch descriptor))
     (should (member "unwatch" async-ops))))
+
+(ert-deftest relay-rewatch-direct-on-connect-resends-watch-and-emits-resync ()
+  "Reconnecting must re-register every direct watch for that authority with
+the new connection and deliver a synthetic `changed' event to each -- the
+resync signal a caller needs after potentially missing real changes while
+disconnected. This is the core of the reconnect-survival fix: the old
+`relay-conn-watches' table lived on the connection object itself, so a
+reconnect (a brand new `relay-conn') silently lost every registration with
+no error and no notification -- see `relay--direct-watches's header
+comment in relay-core.el."
+  (let* ((relay--direct-watches (make-hash-table :test 'equal))
+         (new-conn (relay-test--conn "local"))
+         received
+         watch-ops
+         (descriptor (relay--direct-watch-add
+                      "local" "/root" (lambda (event) (push event received)))))
+    (cl-letf (((symbol-function 'relay--request-async)
+               (lambda (_conn op args _callback) (push (cons op args) watch-ops) 1))
+              ((symbol-function 'run-at-time)
+               (lambda (_delay _repeat function &rest args) (apply function args))))
+      (relay--rewatch-direct-on-connect new-conn))
+    (should (equal (caar watch-ops) "watch"))
+    (should (equal (plist-get (cdar watch-ops) :path) "/root"))
+    (should (= (length received) 1))
+    (should (equal (nth 0 (car received)) descriptor))
+    (should (eq (nth 1 (car received)) 'changed))
+    (should (equal (nth 2 (car received)) "/relay:local:/root"))))
+
+(ert-deftest relay-connect-reconnect-rewatches-and-resyncs-direct-watch ()
+  "End-to-end against a real local server: after the underlying transport
+dies and `relay--connection' establishes a genuinely new connection for the
+same authority, a direct watch registered before the death is still live --
+re-sent to the server and its callback resynced -- without the caller
+having done anything itself to recover it."
+  (let* ((relay--connections (make-hash-table :test 'equal))
+         (relay--direct-watches (make-hash-table :test 'equal))
+         (relay-server-local-path
+          (expand-file-name "server/target/debug/relay-server" relay-test--root))
+         (dir (make-temp-file "relay-rewatch-test-" t))
+         received
+         (conn1 (relay--connection "local")))
+    (unwind-protect
+        (progn
+          (relay--h-file-notify-add-watch
+           (format "/relay:local:%s" dir) '(change)
+           (lambda (event) (push event received)))
+          (should (relay--direct-watches-for "local" (directory-file-name dir)))
+          ;; Kill the underlying transport to force a reconnect on next use.
+          (delete-process (relay-conn-process conn1))
+          (let ((conn2 (relay--connection "local")))
+            (should-not (eq conn1 conn2))
+            (let ((deadline (+ (float-time) 3.0)))
+              (while (and (not received) (< (float-time) deadline))
+                (sleep-for 0.02)))
+            (should received)
+            (should (eq (nth 1 (car received)) 'changed))))
+      (dolist (c (relay-test--hash-values relay--connections))
+        (when (process-live-p (relay-conn-process c))
+          (delete-process (relay-conn-process c))))
+      (when (file-directory-p dir) (delete-directory dir t)))))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Async connection establishment

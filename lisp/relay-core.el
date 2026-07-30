@@ -101,7 +101,6 @@ same as an oversized frame."
   (dircache (make-hash-table :test 'equal)) ; localdir -> list of entry plists
   (dircache-mtime (make-hash-table :test 'equal)) ; localdir -> directory's own mtime at fetch time
   (cache-epoch 0)                           ; invalidates in-flight cache fills
-  (watches (make-hash-table :test 'equal))  ; localdir -> list of (descriptor . callback)
   (callback-queue nil)                      ; reverse-order queue of pending zero-arg thunks
   (drain-scheduled nil)                     ; non-nil while a drain timer is pending
   (ready nil)                               ; non-nil once hello has succeeded (both sync and async paths)
@@ -110,6 +109,73 @@ same as an oversized frame."
 
 (defvar relay--connections (make-hash-table :test 'equal)
   "AUTHORITY string -> `relay-conn'.")
+
+;;;; ---------------------------------------------------------------------------
+;;;; Direct file-notify watch registry
+;;
+;; A `file-notify-add-watch' registration (dired, `auto-revert-mode') used to
+;; live on the specific `relay-conn' that was current when it was added --
+;; but a reconnect replaces that conn object entirely with a fresh one whose
+;; watch table starts empty, silently dropping the registration with no
+;; error and no notification. This registry is keyed by (AUTHORITY .
+;; LOCALDIR) instead, so it survives any number of reconnects; the
+;; descriptors it hands out are `(AUTHORITY . ID)', never a specific conn.
+
+(defvar relay--direct-watches (make-hash-table :test 'equal)
+  "(AUTHORITY . LOCALDIR) -> list of (DESCRIPTOR . CALLBACK).")
+
+(defvar relay--direct-watch-next-id 0
+  "Monotonic counter backing descriptors in `relay--direct-watches'.")
+
+(defun relay--direct-watch-add (authority localdir callback)
+  "Register CALLBACK for LOCALDIR on AUTHORITY and return its descriptor."
+  (let ((descriptor (cons authority (cl-incf relay--direct-watch-next-id))))
+    (push (cons descriptor callback)
+          (gethash (cons authority localdir) relay--direct-watches))
+    descriptor))
+
+(defun relay--direct-watch-remove (descriptor)
+  "Remove DESCRIPTOR from `relay--direct-watches'.
+
+Returns the (AUTHORITY . LOCALDIR) key whose watch list just became empty
+as a result, or nil otherwise -- callers use this to decide whether to tell
+the server to `unwatch' (only when nothing else, e.g. a cached directory
+listing, still needs that directory watched)."
+  (let (emptied-key)
+    (maphash (lambda (key wcs)
+               (when (assq descriptor wcs)
+                 (let ((remaining (assq-delete-all descriptor wcs)))
+                   (puthash key remaining relay--direct-watches)
+                   (unless remaining (setq emptied-key key)))))
+             relay--direct-watches)
+    emptied-key))
+
+(defun relay--direct-watches-for (authority localdir)
+  "Return the (DESCRIPTOR . CALLBACK) list registered for LOCALDIR on
+AUTHORITY, or nil."
+  (gethash (cons authority localdir) relay--direct-watches))
+
+(defun relay--rewatch-direct-on-connect (conn)
+  "Re-register CONN's authority's direct watches with the server, and
+deliver a synthetic `changed' event to each.
+
+The watch died with the old connection (see `relay--direct-watches''s
+header comment); a caller that missed real changes while disconnected needs
+a prompt to re-check its own state, the same signal an actual change would
+have given it -- this is that prompt."
+  (let ((authority (relay-conn-authority conn)))
+    (maphash
+     (lambda (key wcs)
+       (when (and (equal (car key) authority) wcs)
+         (let ((localdir (cdr key)))
+           (relay--request-async conn "watch" (list :path localdir) #'ignore)
+           (dolist (wc wcs)
+             (let* ((descriptor (car wc))
+                    (callback (cdr wc))
+                    (fnevent (list descriptor 'changed
+                                   (format "/relay:%s:%s" authority localdir))))
+               (run-at-time 0 nil (lambda () (ignore-errors (funcall callback fnevent)))))))))
+     relay--direct-watches)))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Deferred callback queue
@@ -577,6 +643,9 @@ Returns nil; this is a purely callback-based API."
       ;; (its dircache starts empty), so without this a reconnect would
       ;; silently leave them lazy until some future visit happened to occur.
       (relay--revalidate-marked-on-connect conn)
+      ;; Same reasoning for direct file-notify watches (dired, auto-revert):
+      ;; see `relay--rewatch-direct-on-connect'.
+      (relay--rewatch-direct-on-connect conn)
       conn)))
 
 ;;;; ---------------------------------------------------------------------------
@@ -688,6 +757,7 @@ callbacks, or calls all waiters' on-error callbacks if the hello failed."
         (setf (relay-conn-hello conn) reply)
         (setf (relay-conn-ready conn) t)
         (relay--revalidate-marked-on-connect conn)
+        (relay--rewatch-direct-on-connect conn)
         (dolist (waiter waiters)
           (when (car waiter)
             (run-at-time 0 nil (car waiter) conn)))))))

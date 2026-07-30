@@ -460,7 +460,7 @@ otherwise indistinguishable to a reconnect-revalidation comparison."
 (defun relay--notify-watchers (conn localpath event)
   "Deliver EVENT for LOCALPATH to direct file-notify watches, deferred."
   (let ((authority (relay-conn-authority conn)))
-    (dolist (wc (gethash localpath (relay-conn-watches conn)))
+    (dolist (wc (relay--direct-watches-for authority localpath))
       (let* ((descriptor (car wc))
              (callback (cdr wc))
              (fnevent (list descriptor event (relay--wrap authority localpath))))
@@ -764,7 +764,7 @@ exceeded)."
         (when (or (and relay-listing-prefetch (relay--listing-prefetch-marked-p authority dir))
                   (relay--content-prefetch-marked-p authority dir))
           (relay--listing-rewarm-async conn dir))
-        (dolist (wc (gethash dir (relay-conn-watches conn)))
+        (dolist (wc (relay--direct-watches-for authority dir))
           (let* ((descriptor (car wc)) (callback (cdr wc))
                  (fnevent (list descriptor
                                 (pcase event ("created" 'created) ("removed" 'deleted)

@@ -374,15 +374,16 @@ what let this go unnoticed at first."
     tmp))
 
 (defun relay--h-file-notify-add-watch (file _flags callback)
-  (let* ((p (relay--parse file)) (conn (relay--connection (car p)))
+  (let* ((p (relay--parse file)) (authority (car p)) (conn (relay--connection authority))
          (localdir (directory-file-name (cdr p))))
     ;; Do not manufacture a descriptor if the server rejected the OS watch.
     ;; Auto-Revert wraps this operation in `ignore-errors'; a real error makes
     ;; it retain a nil descriptor and use its polling fallback when configured.
     (relay--request conn "watch" :path localdir)
-    (let ((descriptor (cons conn (cl-incf (relay-conn-next-id conn)))))
-      (push (cons descriptor callback) (gethash localdir (relay-conn-watches conn)))
-      descriptor)))
+    ;; Registered in `relay--direct-watches' (authority-keyed, not tied to
+    ;; CONN) so this watch survives a reconnect -- see
+    ;; `relay--rewatch-direct-on-connect'.
+    (relay--direct-watch-add authority localdir callback)))
 
 (defun relay--h-file-notify-rm-watch (descriptor)
   "Review caught that this never told the server to `unwatch' at all —
@@ -398,16 +399,16 @@ design (cached directories stay watched for the connection's lifetime).
 Unwatching a directory that's still cached would silently break that
 cache's freshness guarantee for browsing, so only unwatch when the
 directory isn't currently cached either."
-  (let ((conn (car descriptor)) emptied)
-    (maphash (lambda (dir wcs)
-               (when (assq descriptor wcs)
-                 (let ((new-wcs (assq-delete-all descriptor wcs)))
-                   (puthash dir new-wcs (relay-conn-watches conn))
-                   (unless new-wcs (push dir emptied)))))
-             (relay-conn-watches conn))
-    (dolist (dir emptied)
-      (unless (gethash dir (relay-conn-dircache conn))
-        (relay--request-async conn "unwatch" (list :path dir) #'ignore)))))
+  (let* ((authority (car descriptor))
+         (emptied-key (relay--direct-watch-remove descriptor))
+         (conn (and emptied-key (gethash authority relay--connections))))
+    ;; No live connection for this authority means nothing to tell the
+    ;; server to unwatch on -- a reconnect never re-registers a directory
+    ;; this call already removed from `relay--direct-watches'.
+    (when (and emptied-key conn (process-live-p (relay-conn-process conn)))
+      (let ((localdir (cdr emptied-key)))
+        (unless (gethash localdir (relay-conn-dircache conn))
+          (relay--request-async conn "unwatch" (list :path localdir) #'ignore))))))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Mutation operations

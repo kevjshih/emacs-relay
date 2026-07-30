@@ -24,8 +24,7 @@ relay-tests.el)."
    :authority "local"
    :pending (make-hash-table)
    :dircache (make-hash-table :test 'equal)
-   :dircache-mtime (make-hash-table :test 'equal)
-   :watches (make-hash-table :test 'equal)))
+   :dircache-mtime (make-hash-table :test 'equal)))
 
 (defun relay-exec-test--hash-values (table)
   (let (values)

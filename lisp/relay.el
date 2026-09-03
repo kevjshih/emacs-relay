@@ -29,6 +29,7 @@
 (require 'relay-prefetch-ui)
 (require 'relay-completion)
 (require 'relay-conflict)
+(require 'relay-save)
 (require 'relay-file-handler)
 (require 'relay-exec)
 

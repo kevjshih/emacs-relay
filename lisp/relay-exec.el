@@ -176,7 +176,7 @@ Returns nil; this is a purely callback-based API."
   "Async counterpart to `relay-exec-text' -- decodes stdout/stderr as UTF-8.
 
 Text-oriented convenience wrapper around `relay-exec-raw-async'.
-ON-SUCCESS is called with a plist whose :stdout and :stderr are decoded as UTF-8.
+ON-SUCCESS receives a plist whose :stdout and :stderr are decoded as UTF-8.
 ON-ERROR is called if any error occurs (see `relay-exec-raw-async')."
   (relay-exec-raw-async
    authority command

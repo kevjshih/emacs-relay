@@ -7,6 +7,7 @@
 (require 'relay-content-prefetch)
 (require 'relay-completion)
 (require 'relay-conflict)
+(require 'relay-save)
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Attribute conversion
@@ -243,15 +244,20 @@ what let this go unnoticed at first."
     (format "  %s %2d %-8s %-8s %8d %s %s" mode 1 "user" "group" size time name)))
 
 (defun relay--configure-auto-revert-for-current-buffer ()
-  "Permit enabled Auto-Revert modes to act in a relay file buffer."
+  "Finish local setup for a visited Relay file buffer."
   (when (and buffer-file-name (relay--parse buffer-file-name))
     (setq-local auto-revert-remote-files t)
+    (when relay-conflict--base
+      (add-hook 'write-contents-functions #'relay-conflict--write-contents nil t))
     ;; `find-file' creates a new empty buffer without calling our insert
     ;; handler when the path is absent.  Give that visited new-file buffer an
     ;; explicit missing BASE so its first save remains create-only.
     (when (and (not relay-conflict--base)
                (not (relay--h-file-exists-p buffer-file-name)))
-      (relay-conflict--install-buffer "" (list :schema 1 :state "missing") 'utf-8))))
+      (relay-conflict--install-buffer "" (list :schema 1 :state "missing") 'utf-8))
+    ;; `find-file-hook' is the stable point after major-mode setup.  Enabling
+    ;; during `insert-file-contents' can be undone by normal-mode processing.
+    (relay-save--install-buffer)))
 
 (defun relay--h-insert-file-contents (filename &optional visit beg end replace)
   (if (and beg end)

@@ -214,6 +214,17 @@ when clean remote changes become visible, but save correctness does not depend o
 notifications.  An unconfirmed transport write is read back and classified; it
 is never retried blindly.
 
+Interactive `C-x C-s` is implemented by `relay-save.el` as a callback state
+machine. It captures the visited identity, BASE, encoded LOCAL, and a generation,
+then returns before connecting or waiting for the write reply. The standard
+modified bit remains authoritative during the flight. A successful reply advances
+BASE and clears the bit only when both the live identity and bytes still match;
+otherwise it records the confirmed snapshot as BASE but leaves newer edits dirty.
+Repeated saves retain only the latest distinct requested snapshot, dispatched
+against the prior write's returned revision. Any conflict, definite failure, or
+ambiguous result cancels that queue. Direct programmatic saves keep the synchronous
+file-handler path.
+
 This first implementation accepts only regular UTF-8 files up to 16 MiB.
 Binary content, final symlinks, hard links, directories, FIFOs, and other
 non-regular targets are rejected rather than replaced.
@@ -399,9 +410,11 @@ public loader; `relay-core.el` owns framing, transport, and connections;
 `relay-prefetch.el`, `relay-content-prefetch.el`, and
 `relay-prefetch-ui.el` own cache/prefetch policy; `relay-completion.el` owns
 authority completion; `relay-file-handler.el` owns ordinary file operations;
-and `relay-conflict.el` owns revision state, conditional visited saves,
-recovery buffers, and Ediff.  The server's revision implementation is similarly
-isolated in `server/src/revisions/`.
+`relay-conflict.el` owns revision state and synchronous conditional-write
+compatibility, and `relay-save.el` owns asynchronous interactive state and UI;
+the two share request preparation. Recovery buffers and Ediff live at their
+boundary. The server's revision implementation is similarly isolated in
+`server/src/revisions/`.
 
 ---
 

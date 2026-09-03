@@ -999,7 +999,7 @@ having done anything itself to recover it."
           (relay-connect-async "local"
                                (lambda (conn)
                                  (setq conn-result conn done t))
-                               (lambda (err) (setq done t)))
+                               (lambda (_err) (setq done t)))
           ;; Wait for the callback to fire.
           (while (and (not done) (< (float-time) deadline))
             (sleep-for 0.02))
@@ -1368,7 +1368,7 @@ on-error is called asynchronously with a transport error."
           (let ((conn (relay--connection "local")))
             ;; Stub relay-connect-async to provide a connection without tail-read-v1
             (cl-letf (((symbol-function 'relay-connect-async)
-                       (lambda (authority on-ready on-error)
+                       (lambda (_authority on-ready _on-error)
                          ;; Create a fake connection with no tail-read capability
                          (let* ((capabilities (plist-get (relay-conn-hello conn) :capabilities))
                                 ;; Remove tail-read-v1 from the capability list

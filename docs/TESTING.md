@@ -74,7 +74,7 @@ The transport shells out to your system `ssh`, so `~/.ssh/config` (Host aliases,
 | RPC core (id-matched, reentrancy-safe) | implemented and exercised |
 | `readdir`/`stat`/`resolve`/`read`/`write`/`watch` | implemented |
 | find-file completion (browsing) | implemented (cache-backed) |
-| open + revision-safe visited save + local transformed auto-save | implemented for regular UTF-8 files ≤16 MiB |
+| open + async interactive revision-safe save + local transformed auto-save | implemented for regular UTF-8 files ≤16 MiB |
 | dired (`insert-directory`, including revert) | implemented |
 | file-notify / freshness | implemented (invalidate + deferred callback; coarse on overflow) |
 | `relay-exec-raw` / `relay-exec-text` (synchronous, argv-only, bounded output) | implemented |
@@ -95,6 +95,8 @@ run the Rust and focused ERT suites from the repository root:
 /Applications/Emacs.app/Contents/MacOS/Emacs --batch -Q -L lisp -L test \
   -l test/relay-conflict-tests.el -f ert-run-tests-batch-and-exit
 /Applications/Emacs.app/Contents/MacOS/Emacs --batch -Q -L lisp -L test \
+  -l test/relay-save-tests.el -f ert-run-tests-batch-and-exit
+/Applications/Emacs.app/Contents/MacOS/Emacs --batch -Q -L lisp -L test \
   -l test/relay-exec-tests.el -f ert-run-tests-batch-and-exit
 /Applications/Emacs.app/Contents/MacOS/Emacs --batch -Q -L lisp \
   --eval '(setq byte-compile-error-on-warn t)' \
@@ -103,16 +105,21 @@ bash -n scripts/install-server.sh
 git diff --check
 ```
 
-The focused conflict suite covers BASE/LOCAL/REMOTE classification, conditional
-writes, conflict menu choices, independent Ediff snapshots, Auto-Revert enabled
-and disabled, server capability rejection, and uncertain transport outcomes.
-Current local green counts are Rust 34/34, legacy ERT 47/47, conflict ERT
-45/45, and exec ERT 12/12, including runs against
-byte-compiled implementation code.
+The conflict suite covers BASE/LOCAL/REMOTE classification, synchronous
+compatibility writes, conflict choices, Ediff snapshots, Auto-Revert, server
+capability rejection, and transport ambiguity. The async save suite covers
+immediate return and pending state, hook timing, exact-snapshot success, edits,
+renames and killed buffers during flight, delayed visible success, latest-only
+coalescing and revision ordering, queue cancellation, every conflict class,
+lost-reply reconciliation without blind retry, async resolution writes, and
+confirmed-only Ediff closure. Current local green counts are Rust 40/40, core
+ERT 67/67, conflict ERT 47/47, async-save ERT 27/27, and exec ERT 16/16.
 
 For a manual local-server check, visit one tiny regular UTF-8 fixture in two
 buffers.  Save an edit in the first, then save a distinct edit in the second:
-the second save must show the conflict menu rather than overwrite.  Test an
+`C-x C-s` must return while the modified marker and `Saving…` lighter remain;
+the second save must show the conflict banner rather than overwrite. Press
+`C-x C-s` again to open the resolution menu. Test an
 external edit with Auto-Revert both enabled and disabled; a clean buffer may
 reload only when enabled, while a dirty buffer stays untouched and conflicts on
 save.  Test remote deletion separately: a dirty visited buffer must not silently

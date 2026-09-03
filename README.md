@@ -229,6 +229,23 @@ read and conditional write carries a revision token; the server verifies that
 token while holding its mutation lock and atomically replaces only the expected
 regular file.
 
+In a visited Relay buffer, the ordinary `C-x C-s` binding is remapped to an
+asynchronous save command: local final-newline processing and
+`before-save-hook` run before Relay captures the exact bytes, then control
+returns to Emacs while the conditional write is in flight. Direct Lisp calls to
+`save-buffer` and bulk/programmatic save flows retain the synchronous
+`write-contents-functions` path for compatibility. Repeated interactive saves
+coalesce to the newest requested snapshot and use each confirmed returned
+revision in order.
+
+The normal modified marker remains set until the current buffer contents are
+confirmed saved. Buffer-local mode-line states report `Saving…`, `✓ Saved`,
+`✓ Saved; newer edits not saved`, conflicts, unknown outcomes, and failures.
+Actionable failures also add a header-line prompt; press `C-x C-s` there to
+resolve, inspect, or retry. Routine progress and success do not take over the
+shared minibuffer. `✓ Saved` remains visible for two seconds after the buffer is
+actually selected, so a completion in a background buffer is not missed.
+
 Relay retains three byte snapshots for a visited file: **BASE** (the last
 successfully opened, reloaded, or saved revision), **LOCAL** (the current Emacs
 buffer), and **REMOTE** (a fresh server read). A stale save never silently wins.
@@ -244,7 +261,9 @@ Whole-file choices remain conditional on the fetched REMOTE revision. Discarded
 versions are retained in visible read-only recovery buffers. `Merge` runs
 three-way Ediff over independent LOCAL, REMOTE, and BASE snapshots; `C-c C-c`
 applies its result only if neither the live buffer nor REMOTE changed meanwhile,
-and `C-c C-k` leaves the conflict unresolved.
+and `C-c C-k` leaves the conflict unresolved. Write-producing resolutions and
+merge publication are asynchronous; Relay keeps Ediff and recovery buffers open
+until the conditional write is confirmed.
 
 File notifications and Auto-Revert affect when a remote edit is shown, not save
 correctness. With Auto-Revert enabled, a clean buffer reloads a changed REMOTE
@@ -364,6 +383,7 @@ lisp/relay-prefetch*.el      Listing/content prefetch and Dired UI
 lisp/relay-completion.el     Minibuffer authority completion
 lisp/relay-file-handler.el   File-name-handler operations and registration
 lisp/relay-conflict.el       Revision BASE/LOCAL/REMOTE saves and Ediff UI
+lisp/relay-save.el           Async interactive save state, coalescing, and UI
 server/src/revisions/        Revision reads and atomic conditional writes (see its own README.md)
 ```
 

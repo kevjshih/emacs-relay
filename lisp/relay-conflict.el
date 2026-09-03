@@ -21,10 +21,17 @@
   "Unresolved conflict snapshot for the current visited buffer.")
 (defvar-local relay-conflict--pending-read nil
   "A just-read revision awaiting explicit visitation by the caller.")
+(put 'relay-conflict--base 'permanent-local t)
+(put 'relay-conflict--state 'permanent-local t)
+(put 'relay-conflict--pending-read 'permanent-local t)
 (defvar relay-conflict--request-function nil
   "Optional test backend called with OP and decoded argument plist.")
 (defvar relay-conflict--fetch-function nil
   "Optional test backend returning (:bytes BYTES :revision REVISION).")
+(defvar relay-conflict--request-async-function nil
+  "Optional async test backend called with OP, ARGUMENTS, IDENTITY, CALLBACK.")
+(defvar relay-conflict--fetch-async-function nil
+  "Optional async test backend called with IDENTITY and CALLBACK.")
 
 (declare-function relay--content-cache-put "relay-content-prefetch"
                   (authority localpath bytes &optional revision))
@@ -62,39 +69,92 @@ Append and must-be-new writes intentionally retain the old protocol behavior."
    ((eq purpose 'visited) (list :bytes bytes :expected_revision revision))
    (t (list :bytes bytes :legacy t))))
 
+(defun relay-conflict--file-identity (&optional filename)
+  "Return Relay identity for FILENAME, defaulting to the visited file."
+  (let* ((filename (or filename buffer-file-name))
+         (parsed (and filename (relay--parse filename))))
+    (when parsed
+      (list :filename filename :authority (car parsed) :path (cdr parsed)))))
+
+(defun relay-conflict--prepare-rpc (op arguments &optional identity)
+  "Prepare OP and decoded ARGUMENTS for the wire using IDENTITY.
+
+This is the single path/encoding/precondition conversion used by both the
+synchronous compatibility save and asynchronous interactive saves."
+  (let* ((identity (or identity (relay-conflict--file-identity)))
+         (authority (plist-get identity :authority))
+         (target (or (plist-get arguments :path) (plist-get identity :path)))
+         (target-remote (and target (relay--parse target)))
+         (args (copy-sequence arguments)))
+    (unless identity (error "relay conflict save requires a visited relay file"))
+    (when target-remote
+      (unless (equal (car target-remote) authority)
+        (error "Save As must use the same relay authority"))
+      (setq target (cdr target-remote)))
+    (setq args (relay-conflict--plist-without args :path))
+    (when (plist-member args :bytes)
+      (setq args (plist-put (relay-conflict--plist-without args :bytes) :bytes_b64
+                            (base64-encode-string (plist-get arguments :bytes) t))))
+    (when (relay-conflict--revision-missing-p (plist-get args :expected_revision))
+      (setq args (plist-put (relay-conflict--plist-without args :expected_revision)
+                            :expected_state "missing")))
+    (list :op op
+          :identity (list :filename (relay--wrap authority target)
+                          :authority authority :path target)
+          :wire-arguments (append (list :path target) args))))
+
 (defun relay-conflict--rpc (op arguments)
   "Issue OP with decoded ARGUMENTS, using the deterministic test hook if set."
   (if relay-conflict--request-function
       (condition-case err
           (funcall relay-conflict--request-function op arguments)
         (error (list :ok nil :transport t :error (error-message-string err))))
-    (let* ((p (and buffer-file-name (relay--parse buffer-file-name)))
-           (args (copy-sequence arguments))
-           (bytes (plist-get args :bytes))
-           (target (or (plist-get args :path) (and p (cdr p)))))
-      (unless p (error "relay conflict save requires a visited relay file"))
-      (when (plist-get args :path)
-        (let ((target-remote (relay--parse target)))
-          (when target-remote
-            (unless (equal (car target-remote) (car p))
-              (error "Save As must use the same relay authority"))
-            (setq target (cdr target-remote)))))
-      (setq args (relay-conflict--plist-without args :path))
-      (when (plist-member args :bytes)
-        (setq args (plist-put (relay-conflict--plist-without args :bytes) :bytes_b64
-                              (base64-encode-string bytes t))))
-      ;; Tests retain the complete missing revision as an internal value; the
-      ;; wire protocol deliberately spells that create-only precondition as a
-      ;; compact `expected_state: missing'.
-      (when (relay-conflict--revision-missing-p (plist-get args :expected_revision))
-        (setq args (plist-put (relay-conflict--plist-without args :expected_revision)
-                              :expected_state "missing")))
+    (let* ((spec (relay-conflict--prepare-rpc op arguments))
+           (identity (plist-get spec :identity)))
       (condition-case err
-          (apply #'relay--request (relay--connection (car p)) op
-                 (append (list :path target) args))
+          (apply #'relay--request
+                 (relay--connection (plist-get identity :authority)) op
+                 (plist-get spec :wire-arguments))
         (relay-request-error
          (or (nth 2 err) (list :ok nil :error (error-message-string err))))
         (error (list :ok nil :transport t :error (error-message-string err)))))))
+
+(defun relay-conflict--rpc-async (identity op arguments callback)
+  "Issue OP asynchronously for captured IDENTITY and call CALLBACK once."
+  (if relay-conflict--request-async-function
+      (condition-case err
+          (funcall relay-conflict--request-async-function
+                   op arguments identity callback)
+        (error (run-at-time 0 nil callback
+                            (list :ok nil :transport t
+                                  :error (error-message-string err)))))
+    (condition-case err
+        (let* ((spec (relay-conflict--prepare-rpc op arguments identity))
+               (target (plist-get spec :identity)))
+          (relay-connect-async
+           (plist-get target :authority)
+           (lambda (conn)
+             (condition-case send-error
+                 (relay--request-async
+                  conn op (plist-get spec :wire-arguments)
+                  (lambda (reply)
+                    ;; A timed-out write has the same ambiguity as a dead
+                    ;; transport: the server may have published it after the
+                    ;; client stopped waiting.
+                    (funcall callback
+                             (if (plist-get reply :timeout)
+                                 (plist-put (copy-sequence reply) :transport t)
+                               reply)))
+                  relay-request-timeout)
+               (error (funcall callback
+                               (list :ok nil :transport t
+                                     :error (error-message-string send-error))))))
+           (lambda (failure)
+             (funcall callback
+                      (plist-put (copy-sequence failure) :transport t)))))
+      (error (run-at-time 0 nil callback
+                          (list :ok nil :transport t
+                                :error (error-message-string err)))))))
 
 (defun relay-conflict--fetch ()
   "Fetch fresh raw bytes and revision, bypassing any content-prefetch cache."
@@ -105,6 +165,20 @@ Append and must-be-new writes intentionally retain the old protocol behavior."
           (list :bytes (base64-decode-string (plist-get reply :bytes_b64))
                 :revision (plist-get reply :revision))
         (error "%s" (or (plist-get reply :error) "unable to read remote file"))))))
+
+(defun relay-conflict--fetch-async (identity callback)
+  "Fetch fresh bytes and revision for IDENTITY, then call CALLBACK."
+  (if relay-conflict--fetch-async-function
+      (funcall relay-conflict--fetch-async-function identity callback)
+    (relay-conflict--rpc-async
+     identity "read" nil
+     (lambda (reply)
+       (if (plist-get reply :ok)
+           (funcall callback
+                    (list :ok t
+                          :bytes (base64-decode-string (plist-get reply :bytes_b64))
+                          :revision (plist-get reply :revision)))
+         (funcall callback reply))))))
 
 (defun relay-conflict--classify (base local remote &optional remote-revision)
   "Classify BASE, LOCAL, and REMOTE using bytes rather than dirty flags."
@@ -199,6 +273,13 @@ they may be saved elsewhere or cancelled, but never overwritten or merged."
   (let ((arguments (relay-conflict--write-arguments bytes revision 'visited nil nil)))
     (when path (setq arguments (plist-put arguments :path path)))
     (relay-conflict--rpc "write" arguments)))
+
+(defun relay-conflict--write-snapshot-async (identity bytes revision callback
+                                                      &optional path)
+  "Conditionally write BYTES for IDENTITY and call CALLBACK with its reply."
+  (let ((arguments (relay-conflict--write-arguments bytes revision 'visited nil nil)))
+    (when path (setq arguments (plist-put arguments :path path)))
+    (relay-conflict--rpc-async identity "write" arguments callback)))
 
 (defun relay-conflict--save-internal ()
   "Conditionally save this visited buffer, retaining BASE on every failure."
@@ -310,6 +391,19 @@ they may be saved elsewhere or cancelled, but never overwritten or merged."
   "Conditionally save and persist any unresolved retry/uncertain outcome."
   (relay-conflict--remember-incomplete-save
    (relay-conflict--save-internal)))
+
+(defun relay-conflict--report-save-completion (status)
+  "Replace Emacs's in-progress save message for terminal STATUS.
+
+Returning non-nil from `write-contents-functions' tells Emacs that the
+handler performed the write itself.  Emacs therefore does not emit the
+ordinary `Wrote ...' completion message for us; without an explicit terminal
+message, its earlier `Saving file ...' text remains in the echo area until
+some unrelated command replaces it."
+  (let ((file (abbreviate-file-name buffer-file-name)))
+    (pcase status
+      ('saved (message "Wrote %s" file))
+      ('adopted-remote (message "Adopted remote contents of %s" file)))))
 
 (defun relay-conflict--revert (remote)
   "Install fresh REMOTE in a clean buffer and establish the new BASE."
@@ -453,15 +547,21 @@ non-nil, is the fresh snapshot observed while verifying the apply."
 (defun relay-conflict-apply-merge ()
   "Apply the current merge result to its originating live buffer."
   (interactive)
-  (let* ((snapshot relay-conflict--merge-snapshot)
-         (live relay-conflict--merge-live-buffer)
-         (merged (relay-conflict--bytes))
-         (result (with-current-buffer live
-                   (relay-conflict--apply-merge snapshot merged (relay-conflict--bytes)))))
-    (unless (eq (plist-get result :status) 'saved)
-      (message "relay merge was not applied; the result is preserved"))
-    (when (eq (plist-get result :status) 'saved) (relay-conflict--close-ediff))
-    result))
+  (if (and (fboundp 'relay-save-apply-merge-async)
+           (buffer-live-p relay-conflict--merge-live-buffer)
+           (buffer-local-value 'relay-async-save-mode
+                               relay-conflict--merge-live-buffer))
+      (relay-save-apply-merge-async)
+    (let* ((snapshot relay-conflict--merge-snapshot)
+           (live relay-conflict--merge-live-buffer)
+           (merged (relay-conflict--bytes))
+           (result (with-current-buffer live
+                     (relay-conflict--apply-merge snapshot merged
+                                                    (relay-conflict--bytes)))))
+      (unless (eq (plist-get result :status) 'saved)
+        (message "relay merge was not applied; the result is preserved"))
+      (when (eq (plist-get result :status) 'saved) (relay-conflict--close-ediff))
+      result)))
 
 (defun relay-conflict-abandon-merge ()
   "Leave a merge result intact while retaining the original unresolved state."
@@ -532,12 +632,17 @@ non-nil, is the fresh snapshot observed while verifying the apply."
   (when (and buffer-file-name (relay--parse buffer-file-name) relay-conflict--base)
     (let ((result (relay-conflict--save)))
       (pcase (plist-get result :status)
-        ('saved t)
+        ('saved
+         (relay-conflict--report-save-completion 'saved)
+         t)
         ('conflict (if (not noninteractive)
                        (let ((resolution (relay-conflict--interactive-menu
                                           (plist-get result :conflict))))
-                         (if (memq (plist-get resolution :status) '(saved adopted-remote))
-                             t
+                         (if-let* ((status (plist-get resolution :status))
+                                   ((memq status '(saved adopted-remote))))
+                             (progn
+                               (relay-conflict--report-save-completion status)
+                               t)
                            (error "relay conflict remains unresolved")))
                      (error "relay save conflict")))
         (_ (error "relay save is uncertain: %s" (or (plist-get result :error) "unknown error")))))))
@@ -572,7 +677,9 @@ non-nil, is the fresh snapshot observed while verifying the apply."
 (defun relay-conflict--install-buffer (bytes revision &optional coding)
   "Install conflict handling in a successfully visited relay file buffer."
   (relay-conflict--record-base bytes revision coding)
-  (add-hook 'write-contents-functions #'relay-conflict--write-contents nil t))
+  (add-hook 'write-contents-functions #'relay-conflict--write-contents nil t)
+  (when (fboundp 'relay-save--install-buffer)
+    (relay-save--install-buffer)))
 
 (provide 'relay-conflict)
 ;;; relay-conflict.el ends here

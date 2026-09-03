@@ -108,6 +108,44 @@
       (should (equal (plist-get relay-conflict--base :bytes) relay-conflict-test--local))
       (should (equal (plist-get relay-conflict--base :revision) new)))))
 
+(ert-deftest relay-conflict-visited-save-replaces-in-progress-message-on-success ()
+  "A custom visited save must visibly replace Emacs's `Saving file ...' text."
+  (relay-conflict-test--with-buffer
+    (let ((relay-conflict--base
+           (list :bytes relay-conflict-test--base
+                 :revision (relay-conflict-test--revision 'base)
+                 :coding 'utf-8))
+          completion)
+      (cl-letf (((symbol-function 'relay-conflict--save)
+                 (lambda () (list :status 'saved)))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (setq completion (apply #'format format-string args)))))
+        (should (relay-conflict--write-contents)))
+      (should (equal completion
+                     "Wrote /relay:local:/tmp/relay-conflict-fixture.txt")))))
+
+(ert-deftest relay-conflict-resolution-reports-adopted-remote-completion ()
+  "Resolving a save by adopting REMOTE reports that terminal outcome clearly."
+  (relay-conflict-test--with-buffer
+    (let ((relay-conflict--base
+           (list :bytes relay-conflict-test--base
+                 :revision (relay-conflict-test--revision 'base)
+                 :coding 'utf-8))
+          (noninteractive nil)
+          completion)
+      (cl-letf (((symbol-function 'relay-conflict--save)
+                 (lambda () (list :status 'conflict :conflict 'snapshot)))
+                ((symbol-function 'relay-conflict--interactive-menu)
+                 (lambda (_snapshot) (list :status 'adopted-remote)))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (setq completion (apply #'format format-string args)))))
+        (should (relay-conflict--write-contents)))
+      (should (equal completion
+                     (concat "Adopted remote contents of "
+                             "/relay:local:/tmp/relay-conflict-fixture.txt"))))))
+
 (ert-deftest relay-conflict-failed-save-never-advances-base ()
   "A structured conflict retains both the prior BASE and modified LOCAL."
   (relay-conflict-test--with-buffer

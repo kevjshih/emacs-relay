@@ -61,6 +61,23 @@
       (should (= after 1))
       (should (eq relay-save--status 'saved)))))
 
+(ert-deftest relay-save-interactive-command-clears-stale-saving-message ()
+  "Async progress must not leave Emacs's old `Saving file ...' text visible."
+  (relay-save-test--with-buffer
+    (relay-save-test--edit "local\n")
+    (let ((relay-conflict--request-async-function
+           (lambda (_op _args _identity _done) nil))
+          (echo-area "Saving file /relay:local:/tmp/relay-save-fixture.txt...")
+          cleared)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (if format-string
+                       (setq echo-area (apply #'format format-string args))
+                     (setq echo-area nil cleared t)))))
+        (call-interactively #'relay-save-buffer-async))
+      (should cleared)
+      (should-not echo-area))))
+
 (ert-deftest relay-save-final-newline-and-before-hook-precede-capture ()
   "Final-newline work and `before-save-hook' both affect captured bytes."
   (relay-save-test--with-buffer

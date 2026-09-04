@@ -727,6 +727,11 @@ conflict reads, and lost-reply reconciliation finish through callbacks."
   (unless (and relay-async-save-mode buffer-file-name
                (relay--parse buffer-file-name))
     (user-error "Current buffer is not an asynchronous Relay save buffer"))
+  ;; Progress and successful completion live in the mode line.  Clear any
+  ;; echo-area text left by an earlier/superseded save path so `Saving file ...'
+  ;; cannot linger indefinitely while this request completes asynchronously.
+  (when (called-interactively-p 'any)
+    (message nil))
   (cond
    ((eq relay-save--status 'conflict)
     (relay-save--resolve-ready-conflict))

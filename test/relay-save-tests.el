@@ -78,6 +78,28 @@
       (should cleared)
       (should-not echo-area))))
 
+(ert-deftest relay-save-terminal-state-clears-only-a-stale-saving-message ()
+  "A completed callback clears save progress without erasing unrelated text."
+  (relay-save-test--with-buffer
+    (let ((visible "Saving file /relay:local:/tmp/relay-save-fixture.txt...")
+          cleared)
+      (cl-letf (((symbol-function 'current-message) (lambda () visible))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest _args)
+                   (when (null format-string) (setq visible nil cleared t))))
+                ((symbol-function 'relay-save--selected-p) (lambda () t)))
+        (relay-save--set-status 'conflict '(:status conflict)))
+      (should cleared)
+      (setq visible "Unrelated diagnostic" cleared nil)
+      (cl-letf (((symbol-function 'current-message) (lambda () visible))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest _args)
+                   (when (null format-string) (setq visible nil cleared t))))
+                ((symbol-function 'relay-save--selected-p) (lambda () t)))
+        (relay-save--set-status 'failed '(:status failed)))
+      (should-not cleared)
+      (should (equal visible "Unrelated diagnostic")))))
+
 (ert-deftest relay-save-final-newline-and-before-hook-precede-capture ()
   "Final-newline work and `before-save-hook' both affect captured bytes."
   (relay-save-test--with-buffer
@@ -313,6 +335,98 @@
       (should (eq relay-save--status 'saved))
       (should (equal (plist-get relay-conflict--base :revision)
                      (relay-save-test--revision 'one))))))
+
+(ert-deftest relay-save-conflict-read-failure-never-offers-an-empty-remote ()
+  "A conflict without a REMOTE snapshot is retryable failure, not a menu."
+  (relay-save-test--with-buffer
+    (let (write-callback fetch-callback)
+      (relay-save-test--edit "local\n")
+      (let ((relay-conflict--request-async-function
+             (lambda (_op _args _identity done) (setq write-callback done)))
+            (relay-conflict--fetch-async-function
+             (lambda (_identity done) (setq fetch-callback done))))
+        (relay-save-buffer-async)
+        (funcall write-callback
+                 '(:ok nil :error_code "conflict" :conflict (:kind "changed")))
+        (funcall fetch-callback '(:ok nil :transport t :error "read failed")))
+      (should-not relay-save--active)
+      (should (eq relay-save--status 'failed))
+      (should-not relay-conflict--state)
+      (should (buffer-modified-p)))))
+
+(ert-deftest relay-save-unexpected-callback-error-cannot-strand-saving-state ()
+  "Unexpected client errors become an inspectable unknown result."
+  (relay-save-test--with-buffer
+    (let (callback)
+      (relay-save-test--edit "local\n")
+      (let ((relay-conflict--request-async-function
+             (lambda (_op _args _identity done) (setq callback done))))
+        (relay-save-buffer-async)
+        (cl-letf (((symbol-function 'relay-conflict--reply-reason)
+                   (lambda (&rest _) (error "reply parser exploded")))
+                  ((symbol-function 'display-warning) #'ignore))
+          (should-not
+           (condition-case nil
+               (progn (funcall callback '(:ok nil :error "bad reply"))
+                      nil)
+             (error t)))))
+      (should-not relay-save--active)
+      (should (eq relay-save--status 'unknown))
+      (should (buffer-modified-p))
+      (should (eq (plist-get relay-conflict--state :reason) 'client-error)))))
+
+(ert-deftest relay-save-after-save-hook-error-does-not-hide-confirmed-save ()
+  "A post-save hook error cannot leave a committed write showing `Saving'."
+  (relay-save-test--with-buffer
+    (let (callback)
+      (relay-save-test--edit "local\n")
+      (add-hook 'after-save-hook (lambda () (error "hook exploded")) nil t)
+      (let ((relay-conflict--request-async-function
+             (lambda (_op _args _identity done) (setq callback done))))
+        (relay-save-buffer-async)
+        (cl-letf (((symbol-function 'display-warning) #'ignore))
+          (should-not
+           (condition-case nil
+               (progn (funcall callback
+                               (list :ok t :revision
+                                     (relay-save-test--revision 'one)))
+                      nil)
+             (error t)))))
+      (should-not relay-save--active)
+      (should (eq relay-save--status 'saved))
+      (should-not (buffer-modified-p)))))
+
+(ert-deftest relay-save-cache-error-does-not-hide-confirmed-save ()
+  "A cache optimization cannot downgrade an acknowledged remote write."
+  (relay-save-test--with-buffer
+    (let (callback)
+      (relay-save-test--edit "local\n")
+      (let ((relay-conflict--request-async-function
+             (lambda (_op _args _identity done) (setq callback done))))
+        (relay-save-buffer-async)
+        (cl-letf (((symbol-function 'relay-save--cache-identity)
+                   (lambda (&rest _) (error "cache exploded")))
+                  ((symbol-function 'display-warning) #'ignore))
+          (funcall callback
+                   (list :ok t :revision (relay-save-test--revision 'one)))))
+      (should-not relay-save--active)
+      (should (eq relay-save--status 'saved))
+      (should-not (buffer-modified-p)))))
+
+(ert-deftest relay-save-immediate-dispatch-error-cannot-strand-saving-state ()
+  "A client-side dispatch exception becomes terminal and retryable."
+  (relay-save-test--with-buffer
+    (relay-save-test--edit "local\n")
+    (let ((relay-conflict--request-async-function
+           (lambda (&rest _) (error "dispatch exploded"))))
+      (cl-letf (((symbol-function 'display-warning) #'ignore)
+                ((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest args)
+                   (apply function args))))
+        (relay-save-buffer-async)))
+    (should-not relay-save--active)
+    (should (eq relay-save--status 'unknown))
+    (should (buffer-modified-p))))
 
 (ert-deftest relay-save-lost-reply-reconciles-without-blind-write-retry ()
   (relay-save-test--with-buffer

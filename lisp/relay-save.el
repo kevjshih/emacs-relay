@@ -110,6 +110,15 @@
   (relay-save--cancel-success-timer)
   (setq relay-save--status status relay-save--result result)
   (force-mode-line-update t)
+  ;; An outer `save-buffer' wrapper can print its synchronous progress text
+  ;; after this command has returned.  Clear that exact stale progress at the
+  ;; terminal callback, but never erase an unrelated diagnostic.
+  (let ((visible (current-message)))
+    (when (and (not (eq status 'saving))
+               (relay-save--selected-p)
+               (stringp visible)
+               (string-prefix-p "Saving file " visible))
+      (message nil)))
   (when (eq status 'saved)
     (relay-save--start-success-timer-if-visible)))
 
@@ -144,6 +153,26 @@
   (when (fboundp 'relay--content-cache-put)
     (relay--content-cache-put (plist-get identity :authority)
                               (plist-get identity :path) bytes revision)))
+
+(defun relay-save--cache-identity-safely (identity bytes revision)
+  "Update the optional content cache without changing a save outcome."
+  (condition-case err
+      (relay-save--cache-identity identity bytes revision)
+    (error
+     (display-warning
+      'relay (format "Relay saved the file, but could not update its cache: %s"
+                     (error-message-string err))
+      :warning))))
+
+(defun relay-save--run-after-save-hook ()
+  "Run `after-save-hook' without hiding an already confirmed remote write."
+  (condition-case err
+      (run-hooks 'after-save-hook)
+    (error
+     (display-warning
+      'relay (format "Relay saved the file, but an after-save hook failed: %s"
+                     (error-message-string err))
+      :warning))))
 
 (defun relay-save--revision-time (revision)
   "Return REVISION's exact mtime as an Emacs time value."
@@ -232,13 +261,34 @@
           (set-buffer-modified-p t)
           (relay-save--set-status status result))))))
 
+(defun relay-save--callback-error (operation err)
+  "Turn unexpected callback ERR for OPERATION into a terminal safe state."
+  (display-warning
+   'relay (format "Relay asynchronous save callback failed: %s"
+                  (error-message-string err))
+   :error)
+  (if (plist-get operation :merge-buffer)
+      (relay-save--merge-refusal operation 'uncertain "client_error")
+    (let ((state (list :status 'uncertain :reason 'client-error
+                       :base (plist-get operation :base)
+                       :local (plist-get operation :bytes)
+                       :error (error-message-string err))))
+      (relay-save--finish-nonsuccess operation 'unknown state state))))
+
+(defun relay-save--guarded-callback (operation function)
+  "Return a callback applying FUNCTION safely for OPERATION."
+  (lambda (&rest arguments)
+    (condition-case err
+        (apply function arguments)
+      (error (relay-save--callback-error operation err)))))
+
 (defun relay-save--finish-success (operation revision &optional status-extra)
   "Confirm OPERATION at REVISION and dispatch its latest queued successor."
   (let ((buffer (plist-get operation :buffer))
         (identity (or (plist-get operation :target-identity)
                       (plist-get operation :identity)))
         (bytes (plist-get operation :bytes)))
-    (relay-save--cache-identity identity bytes revision)
+    (relay-save--cache-identity-safely identity bytes revision)
     (if (not (buffer-live-p buffer))
         (relay-save--killed-message 'saved identity)
       (with-current-buffer buffer
@@ -268,7 +318,7 @@
               (setq relay-conflict--state nil)
               (relay-save--set-visited-metadata revision)
               (set-buffer-modified-p nil)
-              (run-hooks 'after-save-hook)
+              (relay-save--run-after-save-hook)
               (relay-save--set-status
                (if (equal (relay-conflict--bytes) bytes) 'saved 'saved-newer)
                (list :status 'saved :revision revision
@@ -282,7 +332,7 @@
               (if same-bytes
                   (progn
                     (set-buffer-modified-p nil)
-                    (run-hooks 'after-save-hook)
+                    (relay-save--run-after-save-hook)
                     (unless (equal (relay-conflict--bytes) bytes)
                       (setq same-bytes nil)
                       (set-buffer-modified-p t)))
@@ -314,7 +364,9 @@
   "Reconcile an ambiguous write FAILURE without retrying OPERATION."
   (relay-conflict--fetch-async
    (relay-save--operation-target operation)
-   (lambda (reply)
+   (relay-save--guarded-callback
+    operation
+    (lambda (reply)
      (let ((buffer (plist-get operation :buffer)))
        (when (or (not (buffer-live-p buffer))
                  (with-current-buffer buffer
@@ -347,34 +399,42 @@
                                  operation "changed" remote)))
                   (relay-save--finish-nonsuccess
                    operation 'conflict
-                   (list :status 'conflict :conflict conflict) conflict)))))))))))
+                   (list :status 'conflict :conflict conflict) conflict))))))))))))
 
 (defun relay-save--handle-conflict (operation reply)
   "Fetch and install actionable conflict state after conditional REPLY."
   (let ((reason (or (relay-conflict--reply-reason reply) "changed")))
     (relay-conflict--fetch-async
      (relay-save--operation-target operation)
-     (lambda (read-reply)
+     (relay-save--guarded-callback
+      operation
+      (lambda (read-reply)
        (let ((buffer (plist-get operation :buffer)))
          (when (or (not (buffer-live-p buffer))
                    (with-current-buffer buffer
                      (relay-save--operation-current-p operation)))
-           (let* ((remote
-                   (if (plist-get read-reply :ok)
-                       (list :bytes (plist-get read-reply :bytes)
-                             :revision (plist-get read-reply :revision))
-                     (and (equal reason "deleted")
-                          (list :bytes ""
-                                :revision (list :schema 1 :state "missing")
-                                :deleted t))))
-                  (conflict (relay-save--snapshot-conflict operation reason remote))
-                  (classification (plist-get conflict :classification)))
-             (if (and (listp classification)
-                      (eq (plist-get classification :kind) 'convergent))
-                 (relay-save--finish-success operation (plist-get remote :revision))
+           (if (and (not (plist-get read-reply :ok))
+                    (not (equal reason "deleted")))
                (relay-save--finish-nonsuccess
-                operation 'conflict
-                (list :status 'conflict :conflict conflict) conflict)))))))))
+                operation 'failed
+                (list :status 'failed :reason 'conflict-read
+                      :error (or (plist-get read-reply :error)
+                                 "Could not read the conflicting remote file")))
+             (let* ((remote
+                     (if (plist-get read-reply :ok)
+                         (list :bytes (plist-get read-reply :bytes)
+                               :revision (plist-get read-reply :revision))
+                       (list :bytes ""
+                             :revision (list :schema 1 :state "missing")
+                             :deleted t)))
+                    (conflict (relay-save--snapshot-conflict operation reason remote))
+                    (classification (plist-get conflict :classification)))
+               (if (and (listp classification)
+                        (eq (plist-get classification :kind) 'convergent))
+                   (relay-save--finish-success operation (plist-get remote :revision))
+                 (relay-save--finish-nonsuccess
+                  operation 'conflict
+                  (list :status 'conflict :conflict conflict) conflict)))))))))))
 
 (defun relay-save--write-done (operation reply)
   "Handle terminal conditional write REPLY for OPERATION."
@@ -403,12 +463,15 @@
   (relay-save--set-status 'saving)
   ;; Preserve the ordinary modified marker for the entire network flight.
   (set-buffer-modified-p t)
-  (relay-conflict--write-snapshot-async
-   (plist-get operation :identity)
-   (plist-get operation :bytes)
-   (plist-get operation :expected)
-   (lambda (reply) (relay-save--write-done operation reply))
-   (plist-get operation :save-as))
+  (condition-case err
+      (relay-conflict--write-snapshot-async
+       (plist-get operation :identity)
+       (plist-get operation :bytes)
+       (plist-get operation :expected)
+       (relay-save--guarded-callback
+        operation (lambda (reply) (relay-save--write-done operation reply)))
+       (plist-get operation :save-as))
+    (error (relay-save--callback-error operation err)))
   operation)
 
 (defun relay-save--queue-or-dispatch (operation)
@@ -449,27 +512,32 @@
     (setq operation (plist-put operation :generation (cl-incf relay-save--generation))
           relay-save--active operation)
     (relay-save--set-status 'saving)
-    (relay-conflict--fetch-async
-     identity
-     (lambda (reply)
-       (if (not (plist-get reply :ok))
-           (relay-save--finish-nonsuccess operation 'unknown state state)
-         (let* ((remote (list :bytes (plist-get reply :bytes)
-                              :revision (plist-get reply :revision)))
-                (outcome (relay-conflict--reconcile-uncertain
-                          (plist-get (plist-get state :base) :bytes)
-                          (plist-get state :local) (plist-get remote :bytes)
-                          (plist-get remote :revision))))
-           (pcase (plist-get outcome :status)
-             ('saved (relay-save--finish-success operation
-                                                  (plist-get remote :revision)))
-             ('retry
-              (let ((retry (append (list :status 'retry :remote remote) state)))
-                (relay-save--finish-nonsuccess operation 'unknown outcome retry)))
-             (_
-              (let ((conflict (relay-save--snapshot-conflict
-                               operation "changed" remote)))
-                (relay-save--finish-nonsuccess operation 'conflict outcome conflict))))))))))
+    (condition-case err
+        (relay-conflict--fetch-async
+         identity
+         (relay-save--guarded-callback
+          operation
+          (lambda (reply)
+            (if (not (plist-get reply :ok))
+                (relay-save--finish-nonsuccess operation 'unknown state state)
+              (let* ((remote (list :bytes (plist-get reply :bytes)
+                                   :revision (plist-get reply :revision)))
+                     (outcome (relay-conflict--reconcile-uncertain
+                               (plist-get (plist-get state :base) :bytes)
+                               (plist-get state :local) (plist-get remote :bytes)
+                               (plist-get remote :revision))))
+                (pcase (plist-get outcome :status)
+                  ('saved (relay-save--finish-success
+                           operation (plist-get remote :revision)))
+                  ('retry
+                   (let ((retry (append (list :status 'retry :remote remote) state)))
+                     (relay-save--finish-nonsuccess operation 'unknown outcome retry)))
+                  (_
+                   (let ((conflict (relay-save--snapshot-conflict
+                                    operation "changed" remote)))
+                     (relay-save--finish-nonsuccess
+                      operation 'conflict outcome conflict)))))))))
+      (error (relay-save--callback-error operation err)))))
 
 (defun relay-save--read-conflict-choice (snapshot)
   "Read one existing Relay conflict-menu choice for SNAPSHOT."
@@ -553,7 +621,8 @@
          (erase-buffer)
          (insert (decode-coding-string bytes 'utf-8))
          (relay-conflict--record-base bytes revision 'utf-8)
-         (relay-save--cache-identity (relay-conflict--file-identity) bytes revision)
+         (relay-save--cache-identity-safely
+          (relay-conflict--file-identity) bytes revision)
          (setq relay-conflict--state nil)
          (relay-save--set-visited-metadata revision)
          (set-buffer-modified-p nil)
@@ -596,7 +665,7 @@
         (merge (plist-get operation :merge-buffer))
         (identity (plist-get operation :identity))
         (merged (plist-get operation :bytes)))
-    (relay-save--cache-identity identity merged revision)
+    (relay-save--cache-identity-safely identity merged revision)
     (if (not (buffer-live-p live))
         (relay-save--killed-message 'saved identity)
       (with-current-buffer live
@@ -616,7 +685,7 @@
                     (erase-buffer)
                     (insert (decode-coding-string merged 'utf-8)))
                   (set-buffer-modified-p nil)
-                  (run-hooks 'after-save-hook)
+                  (relay-save--run-after-save-hook)
                   (let ((newer (not (equal (relay-conflict--bytes) merged))))
                     (when newer (set-buffer-modified-p t))
                     (relay-save--set-status
@@ -641,24 +710,28 @@
     ;; The write is never retried.  Only exact REMOTE=MERGED proves success.
     (relay-conflict--fetch-async
      (plist-get operation :identity)
-     (lambda (after)
-       (if (and (plist-get after :ok)
-                (equal (plist-get operation :bytes) (plist-get after :bytes)))
-           (relay-save--merge-success operation (plist-get after :revision))
-         (relay-save--merge-refusal
-          operation 'uncertain "transport"
-          (and (plist-get after :ok)
-               (list :bytes (plist-get after :bytes)
-                     :revision (plist-get after :revision))))))))
+     (relay-save--guarded-callback
+      operation
+      (lambda (after)
+        (if (and (plist-get after :ok)
+                 (equal (plist-get operation :bytes) (plist-get after :bytes)))
+            (relay-save--merge-success operation (plist-get after :revision))
+          (relay-save--merge-refusal
+           operation 'uncertain "transport"
+           (and (plist-get after :ok)
+                (list :bytes (plist-get after :bytes)
+                      :revision (plist-get after :revision)))))))))
    ((relay-conflict--reply-reason reply)
     (relay-conflict--fetch-async
      (plist-get operation :identity)
-     (lambda (after)
-       (relay-save--merge-refusal
-        operation 'conflict (or (relay-conflict--reply-reason reply) "changed")
-        (and (plist-get after :ok)
-             (list :bytes (plist-get after :bytes)
-                   :revision (plist-get after :revision)))))))
+     (relay-save--guarded-callback
+      operation
+      (lambda (after)
+        (relay-save--merge-refusal
+         operation 'conflict (or (relay-conflict--reply-reason reply) "changed")
+         (and (plist-get after :ok)
+              (list :bytes (plist-get after :bytes)
+                    :revision (plist-get after :revision))))))))
    (t
     (relay-save--merge-refusal operation 'failed "server_error"))))
 
@@ -686,8 +759,10 @@
       (relay-conflict--write-snapshot-async
        (plist-get operation :identity) (plist-get operation :bytes)
        (plist-get reply :revision)
-       (lambda (write-reply)
-         (relay-save--merge-write-done operation write-reply)))))))
+       (relay-save--guarded-callback
+        operation
+        (lambda (write-reply)
+          (relay-save--merge-write-done operation write-reply))))))))
 
 (defun relay-save-apply-merge-async ()
   "Publish the current Ediff merge result without blocking Emacs."
@@ -712,9 +787,13 @@
                 relay-save--active operation)
           (set-buffer-modified-p t)
           (relay-save--set-status 'saving)
-          (relay-conflict--fetch-async
-           (plist-get operation :identity)
-           (lambda (reply) (relay-save--merge-verified operation reply)))
+          (condition-case err
+              (relay-conflict--fetch-async
+               (plist-get operation :identity)
+               (relay-save--guarded-callback
+                operation
+                (lambda (reply) (relay-save--merge-verified operation reply))))
+            (error (relay-save--callback-error operation err)))
           operation)))))
 
 ;;;###autoload
